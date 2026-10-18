@@ -1,0 +1,33 @@
+@import "tailwindcss";
+
+:root {
+  --background: #ffffff;
+  --foreground: #171717;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+/* The app is designed light-only (white cards, sky-500 accents). A dark-mode
+   foreground made typed text near-white on white inputs, so keep it light. */
+:root {
+  color-scheme: light;
+}
+
+@layer base {
+  input,
+  textarea,
+  select {
+    color: #1e293b;
+  }
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: Arial, Helvetica, sans-serif;
+}

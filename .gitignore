@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# Next.js build output
+.next/
+out/
+
+# OS
+.DS_Store
+Thumbs.db

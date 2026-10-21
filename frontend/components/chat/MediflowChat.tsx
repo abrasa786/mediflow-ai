@@ -10,6 +10,7 @@ import { supabase } from "@/lib/supabase";
 import { getPatientProfile } from "@/lib/patient";
 import { detectEmergency, triggerEmergency } from "@/lib/emergency";
 import EmergencyStatus from "@/components/emergency/EmergencyStatus";
+import { CLINIC_SOURCE } from "@/lib/clinicApp";
 import { createAppointment, getBookedTimes, timeToMinutes } from "@/lib/appointments";
 import { useLocation, type LocationData } from "@/hooks/useLocation";
 import { ApiError, apiFetch, postJSON } from "@/lib/api";
@@ -517,6 +518,15 @@ export default function MediflowChat({
     if (!option) return bot(say("Which clinic would you like to book?", pickChips()));
 
     c.option = option;
+    if (CLINIC_SOURCE === "mediflow") {
+      // Booking, payment and the patient record happen on the clinic's own page
+      if (!option.bookUrl) {
+        return bot(say(`${option.clinicName} doesn't take online bookings yet. You can call them on ${option.phone || "their listed number"}. Which other clinic would you like?`, pickChips()));
+      }
+      await bot(say(`Great choice! 👍 Opening ${option.clinicName}'s booking page — pick a doctor and time there, and a small confirmation fee is deducted from your consultation fee.`));
+      window.location.assign(option.bookUrl);
+      return;
+    }
     c.days = availableDays(option);
     if (!c.days.length) {
       return bot(say(`Sorry, ${option.doctorName} has no free slots this week 😕 Which other clinic would you like?`, pickChips()));

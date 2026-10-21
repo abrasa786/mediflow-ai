@@ -109,6 +109,7 @@ export type ClinicOption = {
   distanceKm: number | null;
   onMediflow: boolean;
   mapsUrl: string;
+  bookUrl?: string | null; // clinic's own booking page (Mediflow Clinic)
   lat: number;
   lng: number;
 };
@@ -164,6 +165,7 @@ export function toOption(place: Place, tag: SpecialtyTag, specialist: string): C
     distanceKm: place.distance_km,
     onMediflow: place.on_mediflow,
     mapsUrl: place.maps_url,
+    bookUrl: place.book_url ?? null,
     lat: place.lat,
     lng: place.lng,
   };

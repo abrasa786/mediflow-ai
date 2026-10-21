@@ -7,8 +7,10 @@ import { useLocation } from "@/hooks/useLocation";
 import MediflowChat from "@/components/chat/MediflowChat";
 import { getPatientProfile, onboardedKey } from "@/lib/patient";
 import { getUpcomingAppointments, type Appointment } from "@/lib/appointments";
+import { CLINIC_SOURCE } from "@/lib/clinicApp";
 import {
   ensureClinicId,
+  openBooking,
   getHealthFacts,
   getNearbyPlaces,
   getPlatformStats,
@@ -150,6 +152,10 @@ export default function Home() {
   const openClinic = async (place: Place) => {
     setOpening(place.key);
     try {
+      if (CLINIC_SOURCE === "mediflow") {
+        if (!openBooking(place)) { setOpening(null); router.push("/clinics"); }
+        return;
+      }
       const id = await ensureClinicId(place);
       router.push(`/book?clinic=${id}`);
     } catch {
@@ -273,7 +279,7 @@ export default function Home() {
                 {searchResults.length > 0 && (
                   <div className="absolute top-full left-0 right-0 bg-white rounded-2xl shadow-2xl border border-gray-100 mt-2 z-50 overflow-hidden">
                     <div className="px-4 py-2 bg-gray-50 border-b border-gray-100">
-                      <p className="text-xs text-gray-400 font-medium">Clinics &amp; hospitals matching “{searchQuery}” · live from the map</p>
+                      <p className="text-xs text-gray-400 font-medium">Clinics &amp; hospitals matching “{searchQuery}” · on Mediflow</p>
                     </div>
                     {searchResults.map((clinic) => (
                       <button key={clinic.key} onClick={() => openClinic(clinic)} disabled={opening === clinic.key}
@@ -290,7 +296,7 @@ export default function Home() {
                           </div>
                         </div>
                         <div className="text-right flex-shrink-0 ml-3">
-                          <p className="text-sm font-bold text-sky-600">{opening === clinic.key ? "…" : `₹${clinic.fee}`}</p>
+                          <p className="text-sm font-bold text-sky-600">{opening === clinic.key ? "…" : clinic.fee > 0 ? `₹${clinic.fee}` : "Ask clinic"}</p>
                           {clinic.rating != null && <p className="text-xs text-yellow-500">★ {clinic.rating}</p>}
                         </div>
                       </button>

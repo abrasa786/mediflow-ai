@@ -4,6 +4,7 @@
 import { ApiError, apiFetch } from "@/lib/api";
 import { supabase } from "@/lib/supabase";
 import type { Hours } from "@/lib/schedule";
+import { CLINIC_SOURCE, bookingUrl, searchOnboardedClinics, type OnboardedClinic } from "@/lib/clinicApp";
 
 export type PlaceDoctor = {
   id: string;
@@ -46,15 +47,45 @@ export type Place = {
   on_mediflow: boolean; // the clinic has signed up and manages its bookings
   doctors: PlaceDoctor[];
   wait_minutes: number | null;
+  book_url?: string | null; // the clinic's own booking page on Mediflow Clinic
+  next_free?: { date: string; time: string } | null;
 };
 
 export type PlaceResults = { provider: "google" | "osm"; places: Place[]; fetched_at?: number };
+
+const TAGS: [RegExp, string][] = [
+  [/general|physician|family/i, "General"], [/dent|oral/i, "Dental"], [/eye|ophthal|optic/i, "Eye"], [/cardi|heart/i, "Cardio"],
+  [/ortho|bone|joint/i, "Ortho"], [/pediat|paediat|child/i, "Pediatric"], [/derma|skin/i, "Skin"], [/neuro/i, "Neuro"],
+  [/gyn|obstet|women/i, "Gynecology"], [/\bent\b|otolaryn/i, "ENT"], [/psychi|mental/i, "Psychiatry"], [/physio/i, "Physio"], [/gastro/i, "Gastro"],
+];
+
+/** A clinic from Mediflow Clinic, shaped like a Place so every screen shows it the same way. */
+function fromOnboarded(c: OnboardedClinic): Place {
+  const text = [c.specialty ?? "", ...(c.doctors ?? []).map((d) => d.specialty ?? "")].join(" ");
+  const tags = TAGS.filter(([re]) => re.test(text)).map(([, t]) => t);
+  const url = bookingUrl(c);
+  const hasPin = c.lat != null && c.lng != null;
+  return {
+    key: `mediflow:${c.slug}`, source: "mediflow", place_id: null, name: c.name, kind: /dent/i.test(c.specialty ?? "") ? "dentist" : "clinic",
+    lat: c.lat ?? 0, lng: c.lng ?? 0, address: c.address ?? "", area: c.city ?? "", city: c.city ?? "", phone: c.phone ?? "",
+    rating: null, reviews: null, hours: null, hours_known: false, hours_text: "", open_time: null, close_time: null, slot_minutes: 30,
+    specialities: tags.length ? tags : ["General"], fee: c.min_fee ?? 0, fee_estimated: false,
+    maps_url: hasPin ? `https://www.google.com/maps/dir/?api=1&destination=${c.lat},${c.lng}` : `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${c.name} ${c.address ?? ""}`)}`,
+    distance_km: c.distance_km, clinic_id: c.slug, on_mediflow: !!url, book_url: url, next_free: c.next_free ?? null,
+    doctors: (c.doctors ?? []).map((d, i) => ({ id: `${c.slug}:${i}`, clinic_id: c.slug, name: d.name, speciality: d.specialty ?? "", qualification: null, experience_years: null, consultation_fee: d.fee ?? null, rating: null, available_days: null })),
+    wait_minutes: null,
+  };
+}
 
 export async function getNearbyPlaces(
   lat: number,
   lng: number,
   opts: { specialty?: string; radiusKm?: number } = {}
 ): Promise<PlaceResults> {
+  if (CLINIC_SOURCE === "mediflow") {
+    const list = await searchOnboardedClinics({ lat, lng, radiusKm: opts.radiusKm ?? 25, specialty: opts.specialty });
+    return { provider: "osm", places: list.map(fromOnboarded) };
+  }
   const qs = new URLSearchParams({
     lat: String(lat),
     lng: String(lng),
@@ -67,6 +98,10 @@ export async function getNearbyPlaces(
 }
 
 export async function searchPlaces(q: string, loc?: { lat: number; lng: number } | null): Promise<PlaceResults> {
+  if (CLINIC_SOURCE === "mediflow") {
+    const list = await searchOnboardedClinics({ q, lat: loc?.lat, lng: loc?.lng, radiusKm: 500 });
+    return { provider: "osm", places: list.map(fromOnboarded) };
+  }
   const qs = new URLSearchParams({ q });
   if (loc) {
     qs.set("lat", String(loc.lat));
@@ -86,6 +121,7 @@ export async function geocodeAddress(q: string) {
 /** Clinic row id for a listing — saves the map listing on first use. */
 export async function ensureClinicId(place: Pick<Place, "key" | "clinic_id">): Promise<string> {
   if (place.clinic_id) return place.clinic_id;
+  if (CLINIC_SOURCE === "mediflow") throw new ApiError(400, "This clinic is not available for booking.");
   const res = await apiFetch("/places/import", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -132,4 +168,11 @@ export async function getHealthFacts(count = 8): Promise<{ source: string; facts
   } catch {
     return { source: "", facts: [] };
   }
+}
+
+/** Opens the clinic's own booking page (on Mediflow Clinic). Returns false when the clinic doesn't take online bookings. */
+export function openBooking(place: Pick<Place, "book_url">): boolean {
+  if (!place.book_url) return false;
+  window.location.assign(place.book_url);
+  return true;
 }

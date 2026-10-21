@@ -4,7 +4,8 @@ import { supabase } from "@/lib/supabase";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { useLocation } from "@/hooks/useLocation";
-import { directionsUrl, ensureClinicId, getNearbyPlaces, searchPlaces, telHref, type Place } from "@/lib/places";
+import { directionsUrl, ensureClinicId, getNearbyPlaces, openBooking, searchPlaces, telHref, type Place } from "@/lib/places";
+import { CLINIC_SOURCE } from "@/lib/clinicApp";
 import { describeHours } from "@/lib/schedule";
 
 const SPECIALITIES = ["All", "General", "Dental", "Eye", "Cardio", "Ortho", "Pediatric", "Skin", "Neuro", "Gynecology", "ENT", "Gastro", "Psychiatry"];
@@ -110,6 +111,11 @@ function ClinicsContent() {
   async function book(place: Place) {
     setBooking(place.key);
     try {
+      if (CLINIC_SOURCE === "mediflow") {
+        // Booking, payment and the patient record happen on the clinic's own page
+        if (!openBooking(place)) { setError("This clinic doesn't take online bookings yet. Please call them."); setBooking(null); }
+        return;
+      }
       const id = await ensureClinicId(place);
       router.push(`/book?clinic=${id}`);
     } catch (e) {
@@ -261,7 +267,7 @@ function ClinicsContent() {
                       </p>
                     </div>
                     <div className="text-right ml-3">
-                      <p className="text-blue-600 font-semibold text-sm">₹{clinic.fee}</p>
+                      <p className="text-blue-600 font-semibold text-sm">{clinic.fee > 0 ? `₹${clinic.fee}` : "Ask clinic"}</p>
                       <p className="text-xs text-gray-400">{clinic.fee_estimated ? "approx. fee" : "consult fee"}</p>
                     </div>
                   </div>

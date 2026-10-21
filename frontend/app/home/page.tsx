@@ -7,6 +7,17 @@ import { useLocation } from "@/hooks/useLocation";
 import MediflowChat from "@/components/chat/MediflowChat";
 import { getPatientProfile, onboardedKey } from "@/lib/patient";
 import { getUpcomingAppointments, type Appointment } from "@/lib/appointments";
+import {
+  ensureClinicId,
+  getHealthFacts,
+  getNearbyPlaces,
+  getPlatformStats,
+  searchPlaces,
+  type HealthFact,
+  type Place,
+  type PlatformStats,
+} from "@/lib/places";
+import { countHealthReports } from "@/lib/reports";
 
 export default function Home() {
   const router = useRouter();
@@ -17,20 +28,16 @@ export default function Home() {
   const [loading, setLoading] = useState(true);
   const [chatOpen, setChatOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
-  const [searchResults, setSearchResults] = useState<any[]>([]);
+  const [searchResults, setSearchResults] = useState<Place[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [opening, setOpening] = useState<string | null>(null);
   const [factIndex, setFactIndex] = useState(0);
+  const [facts, setFacts] = useState<HealthFact[]>([]);
+  const [factSource, setFactSource] = useState("");
+  const [stats, setStats] = useState<PlatformStats | null>(null);
+  const [nearbyCount, setNearbyCount] = useState<number | null>(null);
+  const [reportCount, setReportCount] = useState(0);
   const searchRef = useRef<HTMLDivElement>(null);
-
-  const healthFacts = [
-    "🫀 Your heart beats about 100,000 times every day",
-    "🧠 The human brain generates about 20 watts of power",
-    "💧 60% of the human body is made of water",
-    "🦷 Tooth enamel is the hardest substance in the human body",
-    "👁️ Your eyes can distinguish about 10 million different colors",
-    "🫁 Adults breathe about 20,000 times a day",
-    "🦴 Babies are born with 270 bones — adults have only 206",
-    "❤️ A woman's heart beats slightly faster than a man's",
-  ];
 
   const specialities = [
     { icon: "🩺", name: "General" }, { icon: "🦷", name: "Dentist", spec: "Dental" },
@@ -38,7 +45,7 @@ export default function Home() {
     { icon: "🫀", name: "Cardio" }, { icon: "🦴", name: "Ortho" },
     { icon: "👶", name: "Pediatric" }, { icon: "🧬", name: "Skin" },
     { icon: "🤰", name: "Gynecology" }, { icon: "🦻", name: "ENT" },
-    { icon: "🧘", name: "Psychiatry" }, { icon: "🦵", name: "Physio" },
+    { icon: "🧘", name: "Psychiatry" }, { icon: "🦵", name: "Physio", spec: "Ortho" },
   ];
 
   const healthTips = [
@@ -85,16 +92,28 @@ export default function Home() {
       setLoading(false);
       requestLocation();
       getUpcomingAppointments(user.id).then(setUpcoming).catch(() => setUpcoming([]));
+      countHealthReports().then(setReportCount);
     };
     getUser();
+    getPlatformStats().then(setStats);
+    getHealthFacts(8).then((r) => { setFacts(r.facts); setFactSource(r.source); });
   }, []);
 
+  // Real clinics around the patient (also warms the cache for the booking flow)
   useEffect(() => {
+    if (!location) return;
+    getNearbyPlaces(location.lat, location.lng, { radiusKm: 5 })
+      .then((r) => setNearbyCount(r.places.length))
+      .catch(() => setNearbyCount(null));
+  }, [location]);
+
+  useEffect(() => {
+    if (!facts.length) return;
     const interval = setInterval(() => {
-      setFactIndex(prev => (prev + 1) % healthFacts.length);
-    }, 4000);
+      setFactIndex(prev => (prev + 1) % facts.length);
+    }, 6000);
     return () => clearInterval(interval);
-  }, []);
+  }, [facts.length]);
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
@@ -107,21 +126,36 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    const search = async () => {
-      if (!searchQuery.trim() || searchQuery.length < 2) {
-        setSearchResults([]);
-        return;
+    const q = searchQuery.trim();
+    if (q.length < 2) {
+      setSearchResults([]);
+      setSearching(false);
+      return;
+    }
+    let stale = false;
+    setSearching(true);
+    const debounce = setTimeout(async () => {
+      try {
+        const { places } = await searchPlaces(q, location);
+        if (!stale) setSearchResults(places.slice(0, 6));
+      } catch {
+        if (!stale) setSearchResults([]);
+      } finally {
+        if (!stale) setSearching(false);
       }
-      const { data } = await supabase
-        .from("clinics")
-        .select("*")
-        .or(`name.ilike.%${searchQuery}%,area.ilike.%${searchQuery}%`)
-        .limit(6);
-      setSearchResults(data || []);
-    };
-    const debounce = setTimeout(search, 300);
-    return () => clearTimeout(debounce);
-  }, [searchQuery]);
+    }, 450);
+    return () => { stale = true; clearTimeout(debounce); };
+  }, [searchQuery, location]);
+
+  const openClinic = async (place: Place) => {
+    setOpening(place.key);
+    try {
+      const id = await ensureClinicId(place);
+      router.push(`/book?clinic=${id}`);
+    } catch {
+      setOpening(null);
+    }
+  };
 
   const handleLogout = async () => {
     await supabase.auth.signOut();
@@ -167,10 +201,14 @@ export default function Home() {
         </div>
       </nav>
 
-      {/* HEALTH FACT TICKER */}
-      <div className="bg-sky-600 text-white text-center py-2 text-xs font-medium">
-        💡 {healthFacts[factIndex]}
-      </div>
+      {/* HEALTH FACT TICKER — real facts from health.gov (MyHealthfinder) */}
+      {facts.length > 0 && (
+        <a href={facts[factIndex % facts.length].url} target="_blank" rel="noopener noreferrer"
+          className="block bg-sky-600 text-white text-center py-2 px-4 text-xs font-medium hover:bg-sky-700 transition-colors">
+          {facts[factIndex % facts.length].icon} {facts[factIndex % facts.length].text}
+          <span className="text-sky-200"> — {facts[factIndex % facts.length].topic}</span>
+        </a>
+      )}
 
       {/* HERO BANNER */}
       <div className="relative bg-gradient-to-br from-sky-400 via-sky-500 to-sky-700 text-white py-12 px-4 overflow-hidden">
@@ -214,7 +252,7 @@ export default function Home() {
               <div className="relative max-w-lg" ref={searchRef}>
                 <div className="flex items-center gap-2 bg-white rounded-2xl px-4 py-3 shadow-lg">
                   <span className="text-sky-500">📍</span>
-                  <span className="text-gray-500 text-sm border-r border-gray-200 pr-3 mr-1 whitespace-nowrap">{location?.city || "Bengaluru"}</span>
+                  <span className="text-gray-500 text-sm border-r border-gray-200 pr-3 mr-1 whitespace-nowrap">{location?.city || location?.area || "Near me"}</span>
                   <input
                     type="text"
                     value={searchQuery}
@@ -235,32 +273,41 @@ export default function Home() {
                 {searchResults.length > 0 && (
                   <div className="absolute top-full left-0 right-0 bg-white rounded-2xl shadow-2xl border border-gray-100 mt-2 z-50 overflow-hidden">
                     <div className="px-4 py-2 bg-gray-50 border-b border-gray-100">
-                      <p className="text-xs text-gray-400 font-medium">Clinics matching "{searchQuery}"</p>
+                      <p className="text-xs text-gray-400 font-medium">Clinics &amp; hospitals matching “{searchQuery}” · live from the map</p>
                     </div>
                     {searchResults.map((clinic) => (
-                      <Link key={clinic.id} href={`/book?clinic=${clinic.id}`}
-                        onClick={() => { setSearchResults([]); setSearchQuery(""); }}
-                        className="flex items-center justify-between px-4 py-3 hover:bg-sky-50 border-b border-gray-50 last:border-0 transition-colors">
-                        <div className="flex items-center gap-3">
-                          <div className="w-9 h-9 bg-sky-100 rounded-xl flex items-center justify-center flex-shrink-0">🏥</div>
-                          <div>
-                            <p className="text-sm font-semibold text-gray-800">{clinic.name}</p>
-                            <p className="text-xs text-gray-400">📍 {clinic.area} • {clinic.specialities?.slice(0, 2).join(", ")}</p>
+                      <button key={clinic.key} onClick={() => openClinic(clinic)} disabled={opening === clinic.key}
+                        className="w-full text-left flex items-center justify-between px-4 py-3 hover:bg-sky-50 border-b border-gray-50 last:border-0 transition-colors disabled:opacity-60">
+                        <div className="flex items-center gap-3 min-w-0">
+                          <div className="w-9 h-9 bg-sky-100 rounded-xl flex items-center justify-center flex-shrink-0">{clinic.kind === "hospital" ? "🏨" : "🏥"}</div>
+                          <div className="min-w-0">
+                            <p className="text-sm font-semibold text-gray-800 truncate">
+                              {clinic.name}{clinic.on_mediflow && <span className="ml-1 text-[10px] text-emerald-600">✓ On Mediflow</span>}
+                            </p>
+                            <p className="text-xs text-gray-400 truncate">
+                              📍 {clinic.area || clinic.address}{clinic.distance_km != null && ` · ${clinic.distance_km} km`}
+                            </p>
                           </div>
                         </div>
                         <div className="text-right flex-shrink-0 ml-3">
-                          <p className="text-sm font-bold text-sky-600">₹{clinic.consultation_fee}</p>
-                          <p className="text-xs text-yellow-500">★ {clinic.rating}</p>
+                          <p className="text-sm font-bold text-sky-600">{opening === clinic.key ? "…" : `₹${clinic.fee}`}</p>
+                          {clinic.rating != null && <p className="text-xs text-yellow-500">★ {clinic.rating}</p>}
                         </div>
-                      </Link>
+                      </button>
                     ))}
                   </div>
                 )}
 
-                {searchQuery.length >= 2 && searchResults.length === 0 && (
+                {searchQuery.trim().length >= 2 && searching && searchResults.length === 0 && (
                   <div className="absolute top-full left-0 right-0 bg-white rounded-2xl shadow-xl border border-gray-100 mt-2 z-50 p-4 text-center">
-                    <p className="text-sm text-gray-400 mb-1">No clinics found for "{searchQuery}"</p>
-                    <Link href="/clinics" className="text-xs text-sky-600 font-medium">Browse all clinics →</Link>
+                    <p className="text-sm text-gray-400">Searching the map…</p>
+                  </div>
+                )}
+
+                {searchQuery.trim().length >= 2 && !searching && searchResults.length === 0 && (
+                  <div className="absolute top-full left-0 right-0 bg-white rounded-2xl shadow-xl border border-gray-100 mt-2 z-50 p-4 text-center">
+                    <p className="text-sm text-gray-400 mb-1">No clinics found for “{searchQuery}”</p>
+                    <Link href="/clinics" className="text-xs text-sky-600 font-medium">Browse clinics near me →</Link>
                   </div>
                 )}
               </div>
@@ -285,7 +332,7 @@ export default function Home() {
                   <p className="text-xs text-sky-300 mt-0.5">Upcoming</p>
                 </div>
                 <div className="bg-sky-800 rounded-xl p-3">
-                  <p className="text-2xl font-bold text-white">0</p>
+                  <p className="text-2xl font-bold text-white">{reportCount}</p>
                   <p className="text-xs text-sky-300 mt-0.5">Reports</p>
                 </div>
               </div>
@@ -295,53 +342,28 @@ export default function Home() {
         </div>
       </div>
 
-      {/* QUICK STATS */}
+      {/* LIVE STATS — real counts, nothing hardcoded */}
       <div className="max-w-6xl mx-auto px-4 mt-6 mb-6">
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-          <div className="bg-white rounded-2xl p-4 shadow-sm border border-gray-100 flex items-center gap-3">
-            <div className="w-10 h-10 bg-sky-100 rounded-xl flex items-center justify-center text-xl">🏥</div>
-            <div>
-              <p className="text-lg font-bold text-gray-800">1,500+</p>
-              <p className="text-xs text-gray-400">Clinics on Mediflow</p>
+          {([
+            ["📍", nearbyCount, "Clinics within 5 km of you", location ? null : "Turn on location"],
+            ["🏥", stats?.clinics, "Clinics on Mediflow", null],
+            ["👨‍⚕️", stats?.doctors, "Doctors on Mediflow", null],
+            ["📅", stats?.appointments, "Appointments booked", stats ? `${stats.appointments_today} today` : null],
+          ] as const).map(([icon, value, label, hint]) => (
+            <div key={label} className="bg-white rounded-2xl p-4 shadow-sm border border-gray-100 flex items-center gap-3">
+              <div className="w-10 h-10 bg-sky-100 rounded-xl flex items-center justify-center text-xl flex-shrink-0">{icon}</div>
+              <div className="min-w-0">
+                <p className="text-lg font-bold text-gray-800">{value == null ? "—" : value.toLocaleString("en-IN")}</p>
+                <p className="text-xs text-gray-400">{label}</p>
+                {hint && <p className="text-[10px] text-sky-600">{hint}</p>}
+              </div>
             </div>
-          </div>
-          <div className="bg-white rounded-2xl p-4 shadow-sm border border-gray-100 flex items-center gap-3">
-            <div className="w-10 h-10 bg-sky-100 rounded-xl flex items-center justify-center text-xl">👨‍⚕️</div>
-            <div>
-              <p className="text-lg font-bold text-gray-800">5,000+</p>
-              <p className="text-xs text-gray-400">Verified Doctors</p>
-            </div>
-          </div>
-          <div className="bg-white rounded-2xl p-4 shadow-sm border border-gray-100 flex items-center gap-3">
-            <div className="w-10 h-10 bg-sky-100 rounded-xl flex items-center justify-center text-xl">📅</div>
-            <div>
-              <p className="text-lg font-bold text-gray-800">50,000+</p>
-              <p className="text-xs text-gray-400">Appointments Booked</p>
-            </div>
-          </div>
-          <div className="bg-white rounded-2xl p-4 shadow-sm border border-gray-100 flex items-center gap-3">
-            <div className="w-10 h-10 bg-sky-100 rounded-xl flex items-center justify-center text-xl">⭐</div>
-            <div>
-              <p className="text-lg font-bold text-gray-800">4.8/5</p>
-              <p className="text-xs text-gray-400">Average Rating</p>
-            </div>
-          </div>
+          ))}
         </div>
       </div>
 
       <div className="max-w-6xl mx-auto px-4">
-
-        {/* AD BANNER */}
-        <div className="bg-gradient-to-r from-sky-500 to-sky-700 rounded-2xl p-5 mb-6 flex items-center justify-between gap-4">
-          <div>
-            <p className="text-xs text-sky-200 font-medium mb-1">🎉 Limited time offer</p>
-            <p className="font-bold text-white text-lg">Free health checkup for new users!</p>
-            <p className="text-sky-100 text-sm">Book your first appointment and get a basic health report free</p>
-          </div>
-          <Link href="/clinics" className="bg-white text-sky-600 font-bold text-sm px-5 py-3 rounded-xl whitespace-nowrap hover:shadow-md flex-shrink-0">
-            Book Free →
-          </Link>
-        </div>
 
         {/* FIND BY SPECIALITY */}
         <div className="bg-white rounded-2xl p-5 shadow-sm mb-6 border border-gray-100">
@@ -432,17 +454,22 @@ export default function Home() {
           )}
         </div>
 
-        {/* HEALTH FACTS */}
-        <div className="bg-sky-50 rounded-2xl p-5 mb-8 border border-sky-100">
-          <h2 className="font-bold text-gray-800 mb-3">🧠 Did you know?</h2>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            {healthFacts.slice(0, 4).map((fact, i) => (
-              <div key={i} className="bg-white rounded-xl p-3 text-sm text-gray-600 shadow-sm border border-sky-50">
-                {fact}
-              </div>
-            ))}
+        {/* HEALTH FACTS — from health.gov, refreshed on every visit */}
+        {facts.length > 0 && (
+          <div className="bg-sky-50 rounded-2xl p-5 mb-8 border border-sky-100">
+            <h2 className="font-bold text-gray-800 mb-3">🧠 Did you know?</h2>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              {facts.slice(0, 4).map((fact) => (
+                <a key={fact.url + fact.text} href={fact.url} target="_blank" rel="noopener noreferrer"
+                  className="bg-white rounded-xl p-3 text-sm text-gray-600 shadow-sm border border-sky-50 hover:border-sky-200 transition-colors">
+                  {fact.icon} {fact.text}
+                  <span className="block text-xs text-sky-600 mt-1">{fact.topic} →</span>
+                </a>
+              ))}
+            </div>
+            {factSource && <p className="text-[11px] text-gray-400 mt-3">Source: {factSource}</p>}
           </div>
-        </div>
+        )}
 
       </div>
 

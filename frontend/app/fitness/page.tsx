@@ -5,6 +5,8 @@ import { getPatientProfile, updateBodyStats } from "@/lib/patient";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { apiFetch } from "@/lib/api";
+import { getFitnessLogs, lastSevenDays, saveTodayLog, type FitnessLog } from "@/lib/fitness";
+import { saveHealthReport } from "@/lib/reports";
 
 type Message = { role: "user" | "ai"; text: string; };
 
@@ -63,16 +65,9 @@ export default function Fitness() {
   const [bloodAnalysis, setBloodAnalysis] = useState<string | null>(null);
   const [analyzingBlood, setAnalyzingBlood] = useState(false);
 
-  // Weekly data
-  const [weeklyData] = useState([
-    { day: "Mon", calories: 1650, steps: 6200, protein: 72 },
-    { day: "Tue", calories: 1820, steps: 8100, protein: 85 },
-    { day: "Wed", calories: 1540, steps: 5400, protein: 68 },
-    { day: "Thu", calories: 1780, steps: 9200, protein: 91 },
-    { day: "Fri", calories: 1620, steps: 7800, protein: 78 },
-    { day: "Sat", calories: 2100, steps: 4200, protein: 62 },
-    { day: "Sun", calories: 1480, steps: 11000, protein: 88 },
-  ]);
+  // Weekly data — the patient's own saved daily logs (fitness_logs)
+  const [weekLogs, setWeekLogs] = useState<FitnessLog[]>([]);
+  const [logLoaded, setLogLoaded] = useState(false);
 
   const tabs = [
     { id: "onboarding", label: "👋 Start Here" },
@@ -87,11 +82,12 @@ export default function Fitness() {
     { id: "subscribe", label: "🥗 Meal Delivery" },
   ];
 
+  // Real services — prices change daily, so we link out instead of quoting them
   const mealPartners = [
-    { name: "FreshMenu", desc: "Healthy chef-cooked meals delivered daily", price: "₹180/meal", tag: "Popular" },
-    { name: "EatFit", desc: "Nutritionist-approved calorie-controlled meals", price: "₹150/meal", tag: "Budget" },
-    { name: "Grow Fit", desc: "Therapeutic diet meals for medical conditions", price: "₹220/meal", tag: "Medical" },
-    { name: "Sahaj Meals", desc: "Traditional Indian healthy home-style cooking", price: "₹120/meal", tag: "Desi" },
+    { name: "FreshMenu", desc: "Healthy chef-cooked meals delivered daily", tag: "Popular" },
+    { name: "EatFit", desc: "Nutritionist-approved calorie-controlled meals", tag: "Budget" },
+    { name: "Healthy salads & bowls", desc: "Salads, grain bowls and high-protein meals near you", tag: "Medical" },
+    { name: "Home-style thali", desc: "Traditional Indian home-style cooking", tag: "Desi" },
   ];
 
   const workouts = [
@@ -123,10 +119,50 @@ export default function Fitness() {
         const h = Number(saved.height) / 100, w = Number(saved.weight);
         if (h && w) setBmi(Math.round(w / (h * h) * 10) / 10);
       }
+      const logs = await getFitnessLogs(7);
+      const today = lastSevenDays(logs)[6].iso;
+      const todayLog = logs.find((l) => l.log_date === today);
+      if (todayLog) {
+        setSteps(todayLog.steps);
+        stepCountRef.current = todayLog.steps;
+        setFoodLog(todayLog.meals ?? []);
+        setGymMinutes(todayLog.gym_minutes);
+      }
+      setWeekLogs(logs);
+      setLogLoaded(true);
       setPageLoading(false);
     };
     getUser();
   }, []);
+
+  // Save today's steps, meals and gym time (debounced) and keep the weekly chart in sync
+  useEffect(() => {
+    if (!logLoaded || !patient?.id) return;
+    const today = lastSevenDays([])[6].iso;
+    const entry: FitnessLog = {
+      log_date: today,
+      steps,
+      calories: foodLog.reduce((s, f) => s + (Number(f.calories) || 0), 0),
+      protein: foodLog.reduce((s, f) => s + (Number(f.protein) || 0), 0),
+      gym_minutes: gymMinutes,
+      meals: foodLog,
+    };
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setWeekLogs((prev) => [...prev.filter((l) => l.log_date !== today), entry]);
+    const t = setTimeout(() => {
+      const { log_date: _, ...rest } = entry;
+      saveTodayLog(patient.id, rest);
+    }, 1500);
+    return () => clearTimeout(t);
+  }, [steps, foodLog, gymMinutes, logLoaded, patient?.id]);
+
+  const weeklyData = lastSevenDays(weekLogs);
+  const weekMax = {
+    calories: Math.max(1, ...weeklyData.map((d) => d.calories)),
+    steps: Math.max(1, ...weeklyData.map((d) => d.steps)),
+    protein: Math.max(1, ...weeklyData.map((d) => d.protein)),
+  };
+  const daysLogged = weeklyData.filter((d) => d.steps || d.calories || d.gymMinutes).length;
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -334,26 +370,31 @@ For example:
     if (!file) return;
     setBloodReport(file.name);
     setAnalyzingBlood(true);
-    const reader = new FileReader();
-    reader.onload = async (ev) => {
+    (async () => {
       try {
+        // PDFs (and text files) go through the backend's text extraction
+        const form = new FormData();
+        form.append("file", file);
+        const extracted = await (await apiFetch(`/extract-report`, { method: "POST", body: form })).json();
+        const reportText = (extracted.text as string) || "";
+        if (reportText.replace(/\s/g, "").length < 20) {
+          setBloodAnalysis("Couldn't read text from this file (scanned photos aren't supported yet). Please upload a PDF or text report.");
+          return;
+        }
         const res = await apiFetch(`/analyze-blood-report`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            report_text: ev.target?.result as string,
-            bodyStats, bmi
-          }),
+          body: JSON.stringify({ report_text: reportText, bodyStats, bmi }),
         });
         const data = await res.json();
         setBloodAnalysis(data.analysis);
+        if (!data.error && data.analysis) saveHealthReport(data.analysis, "fitness");
       } catch {
         setBloodAnalysis("Error analyzing report. Please try again.");
       } finally {
         setAnalyzingBlood(false);
       }
-    };
-    reader.readAsText(file);
+    })();
   };
 
   const speakDailySummary = () => {
@@ -895,7 +936,10 @@ For example:
         {activeTab === "progress" && (
           <div className="space-y-4">
             <div className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
-              <h2 className="font-bold text-gray-800 mb-4">Weekly Progress</h2>
+              <h2 className="font-bold text-gray-800 mb-1">Weekly Progress</h2>
+              <p className="text-xs text-gray-400 mb-4">
+                {daysLogged ? `From your logs — ${daysLogged} of the last 7 days tracked` : "Nothing logged yet — add meals and steps and your week fills in here."}
+              </p>
 
               <p className="text-xs text-gray-500 font-medium uppercase tracking-wide mb-2">Calories This Week</p>
               <div className="flex items-end gap-2 h-32 mb-1">
@@ -903,7 +947,7 @@ For example:
                   <div key={i} className="flex-1 flex flex-col items-center gap-1">
                     <p className="text-xs text-sky-600 font-medium">{d.calories}</p>
                     <div className="w-full bg-sky-400 rounded-t-lg"
-                      style={{ height: `${Math.round(d.calories / 2100 * 80)}px` }} />
+                      style={{ height: `${Math.round(d.calories / weekMax.calories * 80)}px` }} />
                     <p className="text-xs text-gray-400">{d.day}</p>
                   </div>
                 ))}
@@ -914,7 +958,7 @@ For example:
                 {weeklyData.map((d, i) => (
                   <div key={i} className="flex-1 flex flex-col items-center gap-1">
                     <div className="w-full bg-green-400 rounded-t-lg"
-                      style={{ height: `${Math.round(d.steps / 11000 * 80)}px` }} />
+                      style={{ height: `${Math.round(d.steps / weekMax.steps * 80)}px` }} />
                     <p className="text-xs text-gray-400">{d.day}</p>
                   </div>
                 ))}
@@ -925,7 +969,7 @@ For example:
                 {weeklyData.map((d, i) => (
                   <div key={i} className="flex-1 flex flex-col items-center gap-1">
                     <div className="w-full bg-purple-400 rounded-t-lg"
-                      style={{ height: `${Math.round(d.protein / 91 * 60)}px` }} />
+                      style={{ height: `${Math.round(d.protein / weekMax.protein * 60)}px` }} />
                     <p className="text-xs text-gray-400">{d.day}</p>
                   </div>
                 ))}
@@ -933,15 +977,15 @@ For example:
 
               <div className="grid grid-cols-3 gap-3 mt-4">
                 <div className="bg-sky-50 rounded-xl p-3 text-center">
-                  <p className="text-lg font-bold text-sky-600">{Math.round(weeklyData.reduce((s,d) => s+d.calories, 0) / 7)}</p>
+                  <p className="text-lg font-bold text-sky-600">{Math.round(weeklyData.reduce((s,d) => s+d.calories, 0) / Math.max(daysLogged, 1))}</p>
                   <p className="text-xs text-gray-400">Avg Cal/day</p>
                 </div>
                 <div className="bg-green-50 rounded-xl p-3 text-center">
-                  <p className="text-lg font-bold text-green-600">{Math.round(weeklyData.reduce((s,d) => s+d.steps, 0) / 7).toLocaleString()}</p>
+                  <p className="text-lg font-bold text-green-600">{Math.round(weeklyData.reduce((s,d) => s+d.steps, 0) / Math.max(daysLogged, 1)).toLocaleString()}</p>
                   <p className="text-xs text-gray-400">Avg Steps/day</p>
                 </div>
                 <div className="bg-purple-50 rounded-xl p-3 text-center">
-                  <p className="text-lg font-bold text-purple-600">{Math.round(weeklyData.reduce((s,d) => s+d.protein, 0) / 7)}g</p>
+                  <p className="text-lg font-bold text-purple-600">{Math.round(weeklyData.reduce((s,d) => s+d.protein, 0) / Math.max(daysLogged, 1))}g</p>
                   <p className="text-xs text-gray-400">Avg Protein/day</p>
                 </div>
               </div>
@@ -1063,10 +1107,10 @@ For example:
                     <div className="border-2 border-dashed border-sky-300 rounded-2xl p-8 text-center hover:border-sky-500 hover:bg-sky-50 transition-colors">
                       <div className="text-4xl mb-3">📄</div>
                       <p className="font-medium text-gray-700 mb-1">Upload your blood report</p>
-                      <p className="text-xs text-gray-400 mb-3">PDF, image, or text file</p>
+                      <p className="text-xs text-gray-400 mb-3">PDF or text file</p>
                       <span className="bg-sky-500 text-white text-xs px-4 py-2 rounded-xl">Choose File</span>
                     </div>
-                    <input type="file" className="hidden" accept=".pdf,.txt,.jpg,.png,.jpeg" onChange={handleBloodUpload} />
+                    <input type="file" className="hidden" accept=".pdf,.txt" onChange={handleBloodUpload} />
                   </label>
                   <div className="mt-4 bg-sky-50 rounded-xl p-4">
                     <p className="text-xs font-semibold text-sky-700 mb-2">What AI analyses:</p>
@@ -1136,16 +1180,16 @@ For example:
                     </div>
                     <p className="text-sm text-gray-400">{partner.desc}</p>
                   </div>
-                  <p className="text-sky-600 font-bold text-sm whitespace-nowrap ml-3">{partner.price}</p>
                 </div>
-                <button className="w-full bg-sky-500 text-white text-sm py-2.5 rounded-xl hover:bg-sky-600">
-                  Subscribe to {partner.name}
-                </button>
+                <a href={`https://www.swiggy.com/search?query=${encodeURIComponent(partner.name)}`} target="_blank" rel="noopener noreferrer"
+                  className="block text-center w-full bg-sky-500 text-white text-sm py-2.5 rounded-xl hover:bg-sky-600">
+                  See today&apos;s menu &amp; prices on Swiggy ↗
+                </a>
               </div>
             ))}
             <div className="bg-sky-50 rounded-2xl p-4 border border-sky-100">
-              <p className="text-sm font-semibold text-sky-800 mb-1">AI Nutritionist picks meals for you</p>
-              <p className="text-xs text-sky-600 leading-relaxed">Once subscribed, our AI selects meals matching your body stats, goals, and preferences — and adjusts weekly based on your progress.</p>
+              <p className="text-sm font-semibold text-sky-800 mb-1">Order what fits your plan</p>
+              <p className="text-xs text-sky-600 leading-relaxed">Generate your plan in the 📋 Meal Plan tab, then log what you actually eat in 🍽️ Meals — your weekly progress updates from those logs.</p>
             </div>
           </div>
         )}

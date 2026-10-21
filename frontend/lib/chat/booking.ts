@@ -1,8 +1,16 @@
-// Booking logic for the guided chat bot: concern → specialty, budget filter,
-// distance estimate, and day / time slot generation. Clinic data comes from Supabase.
+// Booking logic for the guided chat bot: concern → specialty, fee / rating filters, and day / time
+// slots. Clinics are real: map listings (Google Places / OpenStreetMap) + clinics on Mediflow.
 
-import { supabase } from "@/lib/supabase";
 import type { LocationData } from "@/hooks/useLocation";
+import { ensureClinicId, getNearbyPlaces, type Place } from "@/lib/places";
+import {
+  TYPICAL_HOURS,
+  bookableDays,
+  formatSlot,
+  timeSlots as scheduleSlots,
+  type DayChoice,
+  type Hours,
+} from "@/lib/schedule";
 
 export type SpecialtyTag =
   | "General" | "Pediatric" | "Cardio" | "Ortho" | "Skin" | "Neuro" | "Gynecology"
@@ -52,116 +60,65 @@ export function matchConcern(text: string): Concern | null {
 export const EMERGENCY_RE =
   /chest pain|heart attack|can'?t breathe|cannot breathe|not breathing|difficulty breathing|breathless|accident|labou?r pain|stroke|faint|unconscious|seizure|heavy bleeding|suicid|kill myself|poison|overdose/i;
 
-// ── Budget ──
-export type Budget = { label: string; max: number | null };
-export const BUDGETS: Budget[] = [
-  { label: "Under ₹300", max: 300 },
-  { label: "₹300 – ₹500", max: 500 },
-  { label: "₹500 – ₹1000", max: 1000 },
-  { label: "No preference", max: null },
-];
+// ── Filters (fee slider + minimum rating) ──
+export type Filters = { maxFee: number | null; minRating: number | null }; // null = any
+export const FEE_LIMIT = 10000;
+export const FEE_STEP = 100;
+export const RATING_CHOICES = [null, 3, 3.5, 4, 4.5] as const;
+export const DEFAULT_FILTERS: Filters = { maxFee: null, minRating: null };
 
-export function parseBudget(text: string): Budget | null {
-  const chip = BUDGETS.find((b) => b.label === text);
-  if (chip) return chip;
-  if (/no pref|any|doesn'?t matter|no limit/i.test(text)) return BUDGETS[3];
-  const nums = text.replace(/,/g, "").match(/\d+/g);
-  if (!nums) return null;
-  const max = Math.max(...nums.map(Number));
-  return max >= 50 ? { label: `Up to ₹${max}`, max } : null;
+export const feeLabel = (max: number | null) =>
+  max == null || max >= FEE_LIMIT ? "Any fee" : `Up to ₹${max.toLocaleString("en-IN")}`;
+export const ratingLabel = (min: number | null) => (min == null ? "Any rating" : `${min}★ & above`);
+export const filtersLabel = (f: Filters) => `${feeLabel(f.maxFee)} · ${ratingLabel(f.minRating)}`;
+
+/** Typed filters, e.g. "under 800", "4 star", "no preference". */
+export function parseFilters(text: string): Filters | null {
+  if (/no pref|any|doesn'?t matter|no limit|skip/i.test(text)) return { ...DEFAULT_FILTERS };
+  const t = text.replace(/,/g, "");
+  const rating = t.match(/(\d(?:\.\d)?)\s*(?:\+|★|⭐|stars?|rating)/i);
+  const minRating = rating ? Math.min(5, Number(rating[1])) : null;
+  const fees = t.replace(rating?.[0] ?? "", "").match(/\d+/g)?.map(Number).filter((n) => n >= 50) ?? [];
+  const maxFee = fees.length ? Math.min(FEE_LIMIT, Math.max(...fees)) : null;
+  return rating || fees.length ? { maxFee, minRating } : null;
 }
 
-// ── Clinics ──
-type ClinicRow = {
-  id: string;
-  name: string;
-  address: string;
-  area: string;
-  city: string;
-  specialities: string[] | null;
-  rating: number;
-  total_reviews: number;
-  consultation_fee: number;
-  wait_time_minutes: number;
-  phone: string;
-  open_time: string | null;
-  close_time: string | null;
-};
-
-type DoctorRow = {
-  id: string;
-  clinic_id: string;
-  name: string;
-  speciality: string;
-  qualification: string;
-  experience_years: number;
-  consultation_fee: number;
-  rating: number;
-  available_days: string[] | null;
-};
-
+// ── Clinics (real, from the map + clinics registered on Mediflow) ──
 export type ClinicOption = {
-  clinicId: string;
+  key: string; // listing key — used to save the clinic on first booking
+  clinicId: string | null; // null until the listing is saved in our database
   clinicName: string;
   area: string;
   address: string;
   phone: string;
-  rating: number;
-  reviews: number;
-  waitMins: number;
-  openTime: string;
-  closeTime: string;
+  rating: number | null;
+  reviews: number | null;
+  doctorRating: number | null;
+  waitMins: number | null;
+  hours: Hours;
+  hoursKnown: boolean;
+  slotMinutes: number;
   doctorId: string | null;
   doctorName: string;
   doctorSpecialty: string;
   qualification: string;
   experience: number | null;
   fee: number;
-  availableDays: string[];
+  feeEstimated: boolean;
+  availableDays: string[] | null; // doctor's working days (registered clinics)
   distanceKm: number | null;
+  onMediflow: boolean;
+  mapsUrl: string;
+  lat: number;
+  lng: number;
 };
 
 export type ClinicSearch = {
   options: ClinicOption[];
-  note: string | null; // explains any fallback (no specialist / over budget)
+  note: string | null; // explains any fallback (no specialist / no match for the filters / wider radius)
 };
 
-// Approximate centres of the areas we have clinics in (Bengaluru)
-const AREA_COORDS: Record<string, [number, number]> = {
-  "MG Road": [12.9756, 77.605],
-  Koramangala: [12.9352, 77.6245],
-  Indiranagar: [12.9784, 77.6408],
-  "JP Nagar": [12.9063, 77.5857],
-  Whitefield: [12.9698, 77.75],
-  Jayanagar: [12.925, 77.5938],
-  HSR: [12.9116, 77.6474],
-  "HSR Layout": [12.9116, 77.6474],
-  Bellandur: [12.9304, 77.6784],
-  "Electronic City": [12.8452, 77.6602],
-  Marathahalli: [12.9569, 77.7011],
-  Hebbal: [13.0358, 77.597],
-  Malleshwaram: [13.0031, 77.5643],
-  BTM: [12.9166, 77.6101],
-};
-
-function haversineKm(a: [number, number], b: [number, number]) {
-  const R = 6371;
-  const dLat = ((b[0] - a[0]) * Math.PI) / 180;
-  const dLng = ((b[1] - a[1]) * Math.PI) / 180;
-  const h =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos((a[0] * Math.PI) / 180) * Math.cos((b[0] * Math.PI) / 180) * Math.sin(dLng / 2) ** 2;
-  return 2 * R * Math.asin(Math.sqrt(h));
-}
-
-/** Approximate km from the user to a clinic's area (null if unknown). */
-export function areaDistanceKm(area: string, loc: LocationData | null): number | null {
-  const coords = AREA_COORDS[area];
-  if (!loc || !coords) return null;
-  return Math.round(haversineKm([loc.lat, loc.lng], coords) * 10) / 10;
-}
-
-const DOCTOR_TAG: Record<string, SpecialtyTag> = {
+export const DOCTOR_TAG: Record<string, SpecialtyTag> = {
   "general physician": "General",
   pediatrician: "Pediatric",
   gynecologist: "Gynecology",
@@ -177,140 +134,124 @@ const DOCTOR_TAG: Record<string, SpecialtyTag> = {
   oncologist: "Oncology",
 };
 
-function toOption(
-  clinic: ClinicRow,
-  doctors: DoctorRow[],
-  tag: SpecialtyTag,
-  specialist: string,
-  loc: LocationData | null
-): ClinicOption {
-  // Only ever show a doctor of the right specialty. If the clinic lists the
-  // specialty but no named doctor, show "<Specialist> on duty" — never a
-  // doctor from an unrelated specialty (e.g. a gynecologist for a child).
-  const doctor = doctors.find((d) => DOCTOR_TAG[d.speciality?.toLowerCase()] === tag) || null;
+export function toOption(place: Place, tag: SpecialtyTag, specialist: string): ClinicOption {
+  // Only ever show a doctor of the right specialty. Map listings (and clinics without a
+  // matching doctor) show "<Specialist> on duty" — never a doctor from an unrelated specialty.
+  const doctor = place.doctors.find((d) => DOCTOR_TAG[d.speciality?.toLowerCase()] === tag) || null;
+  const hours = place.hours ?? TYPICAL_HOURS;
   return {
-    clinicId: clinic.id,
-    clinicName: clinic.name,
-    area: clinic.area,
-    address: clinic.address,
-    phone: clinic.phone,
-    rating: clinic.rating,
-    reviews: clinic.total_reviews,
-    waitMins: clinic.wait_time_minutes,
-    openTime: clinic.open_time || "09:00",
-    closeTime: clinic.close_time || "21:00",
+    key: place.key,
+    clinicId: place.clinic_id,
+    clinicName: place.name,
+    area: place.area || place.city,
+    address: place.address,
+    phone: place.phone,
+    rating: place.rating,
+    reviews: place.reviews,
+    doctorRating: doctor?.rating ?? null,
+    waitMins: place.wait_minutes,
+    hours,
+    hoursKnown: place.hours_known,
+    slotMinutes: place.slot_minutes || 30,
     doctorId: doctor?.id ?? null,
     doctorName: doctor?.name ?? `${specialist} on duty`,
     doctorSpecialty: doctor?.speciality ?? specialist,
     qualification: doctor?.qualification ?? "",
     experience: doctor?.experience_years ?? null,
-    fee: doctor?.consultation_fee ?? clinic.consultation_fee,
-    availableDays: doctor?.available_days?.length ? doctor.available_days : ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"],
-    distanceKm: areaDistanceKm(clinic.area, loc),
+    fee: doctor?.consultation_fee ?? place.fee,
+    feeEstimated: doctor ? false : place.fee_estimated,
+    availableDays: doctor?.available_days?.length ? doctor.available_days : null,
+    distanceKm: place.distance_km,
+    onMediflow: place.on_mediflow,
+    mapsUrl: place.maps_url,
+    lat: place.lat,
+    lng: place.lng,
   };
 }
 
 function rank(a: ClinicOption, b: ClinicOption) {
-  // Nearest first when we know the distance, then best rated, then cheapest
-  if (a.distanceKm != null && b.distanceKm != null && Math.abs(a.distanceKm - b.distanceKm) > 1) {
-    return a.distanceKm - b.distanceKm;
-  }
-  return b.rating - a.rating || a.fee - b.fee;
+  // Nearest first (clinics that manage bookings on Mediflow get a 1 km head start), then rating, then fee
+  const da = (a.distanceKm ?? 99) - (a.onMediflow ? 1 : 0);
+  const db = (b.distanceKm ?? 99) - (b.onMediflow ? 1 : 0);
+  if (Math.abs(da - db) > 0.5) return da - db;
+  return (b.rating ?? 0) - (a.rating ?? 0) || a.fee - b.fee;
 }
 
-/** Find clinics for a specialty within budget, with sensible fallbacks. */
+/** The rating a patient filters on: the doctor's own rating once we have one, else the clinic's. */
+export const optionRating = (o: ClinicOption) => o.doctorRating ?? o.rating;
+
+/** Real clinics near the patient for a specialty that match the filters, with sensible fallbacks. */
 export async function findClinics(
   tag: SpecialtyTag,
   specialist: string,
-  budget: Budget,
+  filters: Filters,
   loc: LocationData | null
 ): Promise<ClinicSearch> {
-  const [{ data: clinics, error }, { data: doctors }] = await Promise.all([
-    supabase.from("clinics").select("*").eq("is_active", true),
-    supabase.from("doctors").select("*"),
-  ]);
-  if (error) throw error;
+  if (!loc) return { options: [], note: null };
 
-  const all = (clinics as ClinicRow[] | null) ?? [];
-  const docs = (doctors as DoctorRow[] | null) ?? [];
-  const docsFor = (id: string) => docs.filter((d) => d.clinic_id === id);
-  const withinBudget = (o: ClinicOption) => budget.max == null || o.fee <= budget.max;
+  let { places } = await getNearbyPlaces(loc.lat, loc.lng, { specialty: tag, radiusKm: 5 });
+  let widened = false;
+  if (places.filter((p) => p.specialities.includes(tag)).length < 2) {
+    // Add the wider results to the nearby ones — never drop clinics that are close by
+    const seen = new Set(places.map((p) => p.key));
+    const wider = (await getNearbyPlaces(loc.lat, loc.lng, { specialty: tag, radiusKm: 15 })).places;
+    places = [...places, ...wider.filter((p) => !seen.has(p.key))];
+    widened = true;
+  }
 
-  const hasTag = (c: ClinicRow, t: SpecialtyTag) =>
-    (c.specialities || []).includes(t) || docsFor(c.id).some((d) => DOCTOR_TAG[d.speciality?.toLowerCase()] === t);
+  const matches = (o: ClinicOption) =>
+    (filters.maxFee == null || filters.maxFee >= FEE_LIMIT || o.fee <= filters.maxFee) &&
+    (filters.minRating == null || (optionRating(o) ?? 0) >= filters.minRating);
+  // Hospitals are multi-specialty; a specialty clinic only counts for its own specialty
+  const specialists = places.filter((p) => p.specialities.includes(tag)).map((p) => toOption(p, tag, specialist));
+  const generals = places.filter((p) => p.specialities.includes("General")).map((p) => toOption(p, "General", "General Physician"));
+  const wide = widened ? " (I looked a little further out to find these)" : "";
 
-  const specialists = all.filter((c) => hasTag(c, tag)).map((c) => toOption(c, docsFor(c.id), tag, specialist, loc));
-  const generals = all.filter((c) => hasTag(c, "General")).map((c) => toOption(c, docsFor(c.id), "General", "General Physician", loc));
+  // 1. Right specialist, matching the filters
+  let options = specialists.filter(matches).sort(rank);
+  if (options.length) return { options, note: wide ? `Nothing close by, so I searched wider${wide}.` : null };
 
-  // 1. Right specialist, within budget
-  let options = specialists.filter(withinBudget).sort(rank);
-  if (options.length) return { options, note: null };
-
-  // 2. General Physician within budget (they can examine and refer)
-  options = generals.filter(withinBudget).sort(rank);
+  // 2. General Physician matching the filters (they can examine and refer)
+  options = generals.filter(matches).sort(rank);
   if (options.length) {
     const why = specialists.length
-      ? `${specialist}s nearby are above your budget`
-      : `We don't have ${/^[aeiou]/i.test(specialist) ? "an" : "a"} ${specialist} listed nearby yet`;
+      ? `${specialist}s nearby don't match your filters`
+      : `I couldn't find ${/^[aeiou]/i.test(specialist) ? "an" : "a"} ${specialist} near you on the map`;
     return {
       options,
       note: tag === "General" ? null : `${why}, so here are General Physicians who can examine you and refer you if needed.`,
     };
   }
 
-  // 3. Nothing within budget — show the closest-priced options
-  options = (specialists.length ? specialists : generals).sort((a, b) => a.fee - b.fee || rank(a, b));
+  // 3. Nothing matches — show the nearest options and say why
+  options = (specialists.length ? specialists : generals).sort(rank);
+  const unrated = filters.minRating != null && options.every((o) => optionRating(o) == null);
   return {
     options,
-    note: options.length ? `Nothing fits ${budget.label.toLowerCase()} right now — these are the most affordable options.` : null,
+    note: !options.length
+      ? null
+      : unrated
+        ? "These clinics don't have ratings yet, so I couldn't filter by rating — here are the nearest ones."
+        : `Nothing matches ${filtersLabel(filters).toLowerCase()} right now — here are the nearest options.`,
   };
 }
 
-// ── Day & time slots ──
-const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-
-function toMinutes(hhmm: string) {
-  const [h, m] = hhmm.split(":").map(Number);
-  return h * 60 + (m || 0);
+/** Saved clinic id for an option (saves the map listing on first booking). */
+export async function ensureOptionClinic(option: ClinicOption): Promise<string> {
+  if (!option.clinicId) option.clinicId = await ensureClinicId({ key: option.key, clinic_id: null });
+  return option.clinicId;
 }
 
-export function formatSlot(mins: number) {
-  const h = Math.floor(mins / 60);
-  const m = mins % 60;
-  const suffix = h >= 12 ? "PM" : "AM";
-  const h12 = h % 12 === 0 ? 12 : h % 12;
-  return `${String(h12).padStart(2, "0")}:${String(m).padStart(2, "0")} ${suffix}`;
-}
+// ── Day & time slots (from the clinic's real opening hours) ──
+export type { DayChoice };
+export { formatSlot };
 
 export function timeSlots(option: ClinicOption, date: Date): string[] {
-  const open = toMinutes(option.openTime);
-  const close = toMinutes(option.closeTime);
-  const now = new Date();
-  const isToday = date.toDateString() === now.toDateString();
-  const earliest = isToday ? now.getHours() * 60 + now.getMinutes() + 45 : 0;
-  const slots: string[] = [];
-  for (let t = Math.ceil(open / 60) * 60; t <= close - 60; t += 60) {
-    if (t >= earliest) slots.push(formatSlot(t));
-  }
-  return slots;
+  return scheduleSlots(option.hours, date, option.slotMinutes);
 }
 
-export type DayChoice = { label: string; iso: string; date: Date };
-
 export function availableDays(option: ClinicOption, count = 5): DayChoice[] {
-  const days: DayChoice[] = [];
-  for (let i = 0; i < 14 && days.length < count; i++) {
-    const d = new Date();
-    d.setHours(0, 0, 0, 0);
-    d.setDate(d.getDate() + i);
-    if (!option.availableDays.includes(DAY_NAMES[d.getDay()])) continue;
-    if (i === 0 && timeSlots(option, d).length === 0) continue;
-    const label =
-      i === 0 ? "Today" : i === 1 ? "Tomorrow" : d.toLocaleDateString("en-IN", { weekday: "short", day: "numeric", month: "short" });
-    const iso = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-    days.push({ label, iso, date: d });
-  }
-  return days;
+  return bookableDays(option.hours, { doctorDays: option.availableDays, slotMinutes: option.slotMinutes, count });
 }
 
 export function pharmacyLinks(term: string) {
@@ -318,6 +259,6 @@ export function pharmacyLinks(term: string) {
   return [
     { name: "Tata 1mg", url: `https://www.1mg.com/search/all?name=${q}` },
     { name: "PharmEasy", url: `https://pharmeasy.in/search/all?name=${q}` },
-    { name: "Netmeds", url: `https://www.netmeds.com/catalogsearch/result/${q}/all` },
+    { name: "Netmeds", url: `https://www.netmeds.com/products?q=${q}` },
   ];
 }

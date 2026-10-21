@@ -89,8 +89,8 @@ export async function getActiveEmergencies(clinicId: string): Promise<ClinicEmer
 }
 
 export async function getClinicDoctors(clinicId: string): Promise<{ id: string; name: string; speciality: string }[]> {
-  const { data } = await supabase.from("doctors").select("id, name, speciality").eq("clinic_id", clinicId);
-  return data ?? [];
+  const { data } = await supabase.from("doctors").select("*").eq("clinic_id", clinicId);
+  return ((data as { id: string; name: string; speciality: string; is_active?: boolean }[]) ?? []).filter((d) => d.is_active !== false);
 }
 
 /** "Spoke to Patient" / "Doctor Assigned" — stops all escalation and notifies patient + contact. */
@@ -104,7 +104,7 @@ export async function respondToEmergency(caseId: string, action: "spoke_to_patie
   }
 }
 
-export async function markAppointment(id: string, status: "arrived" | "no_show" | "completed" | "confirmed") {
+export async function markAppointment(id: string, status: "arrived" | "no_show" | "completed" | "confirmed" | "cancelled") {
   const { error } = await supabase.rpc("clinic_mark_appointment", { p_id: id, p_status: status });
   if (error) throw error;
 }
@@ -116,4 +116,107 @@ export function ageFromDob(dob?: string | null) {
   let age = now.getFullYear() - d.getFullYear();
   if (now.getMonth() < d.getMonth() || (now.getMonth() === d.getMonth() && now.getDate() < d.getDate())) age--;
   return age;
+}
+
+// ── Self-serve sign-up & clinic settings ──
+
+export type ClinicRegistration = {
+  clinicId: string | null; // an existing map listing being claimed, or null for a new clinic
+  name: string;
+  phone: string;
+  whatsapp: string;
+  address: string;
+  area: string;
+  city: string;
+  lat: number;
+  lng: number;
+  specialities: string[];
+  fee: number;
+  open: string; // "09:00"
+  close: string; // "21:00"
+  days: string[]; // ["Mon", …]
+  emergency: boolean;
+};
+
+/** Claims a map listing (or creates a clinic) and makes the signed-in user its owner. */
+export async function registerClinic(r: ClinicRegistration): Promise<string> {
+  const { data, error } = await supabase.rpc("register_clinic", {
+    p_clinic: r.clinicId,
+    p_name: r.name,
+    p_phone: r.phone,
+    p_whatsapp: r.whatsapp,
+    p_address: r.address,
+    p_area: r.area,
+    p_city: r.city,
+    p_lat: r.lat,
+    p_lng: r.lng,
+    p_specialities: r.specialities,
+    p_fee: r.fee,
+    p_open: r.open,
+    p_close: r.close,
+    p_days: r.days,
+    p_emergency: r.emergency,
+  });
+  if (error) throw new Error(/could not find the function|PGRST202/i.test(error.message) ? "Database update pending — run migration 20261019_real_data.sql." : error.message);
+  return data as string;
+}
+
+export type ClinicProfile = ClinicInfo & {
+  city: string;
+  whatsapp_phone: string | null;
+  consultation_fee: number;
+  specialities: string[] | null;
+  open_time: string | null;
+  close_time: string | null;
+  hours: Record<string, [number, number][]> | null;
+  slot_minutes: number | null;
+  is_emergency_ready: boolean;
+  latitude: number | null;
+  longitude: number | null;
+};
+
+export async function getClinicProfile(id: string): Promise<ClinicProfile | null> {
+  const { data } = await supabase.from("clinics").select("*").eq("id", id).maybeSingle();
+  return (data as ClinicProfile) ?? null;
+}
+
+export async function updateClinicProfile(id: string, values: Partial<ClinicProfile>) {
+  const res = await supabase.from("clinics").update(values).eq("id", id).select("id");
+  if (res.error) throw res.error;
+  if (!res.data?.length) throw new Error("No permission to update this clinic.");
+}
+
+export type ClinicDoctor = {
+  id: string;
+  clinic_id: string;
+  name: string;
+  speciality: string;
+  qualification: string | null;
+  experience_years: number | null;
+  consultation_fee: number | null;
+  available_days: string[] | null;
+  is_active: boolean;
+};
+
+export async function listClinicDoctors(clinicId: string): Promise<ClinicDoctor[]> {
+  const { data } = await supabase.from("doctors").select("*").eq("clinic_id", clinicId).order("name");
+  return ((data as ClinicDoctor[]) ?? []).map((d) => ({ ...d, is_active: d.is_active !== false }));
+}
+
+export async function saveClinicDoctor(d: Partial<ClinicDoctor> & { clinic_id: string }) {
+  const values = {
+    clinic_id: d.clinic_id,
+    name: d.name?.trim(),
+    speciality: d.speciality,
+    qualification: d.qualification || null,
+    experience_years: d.experience_years ?? null,
+    consultation_fee: d.consultation_fee ?? null,
+    available_days: d.available_days?.length ? d.available_days : null,
+    is_active: d.is_active ?? true,
+  };
+  const res = d.id
+    ? await supabase.from("doctors").update(values).eq("id", d.id).select("id")
+    : await supabase.from("doctors").insert({ ...values, rating: null, total_reviews: null }).select("id");
+  if (res.error) throw res.error;
+  if (!res.data?.length) throw new Error("No permission to change doctors for this clinic.");
 }

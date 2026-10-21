@@ -14,17 +14,20 @@ import { createAppointment, getBookedTimes, timeToMinutes } from "@/lib/appointm
 import { useLocation, type LocationData } from "@/hooks/useLocation";
 import { ApiError, apiFetch, postJSON } from "@/lib/api";
 import { extractOptions, normalize } from "@/lib/chat/format";
+import { saveHealthReport } from "@/lib/reports";
 import {
-  BUDGETS,
   CONCERNS,
+  DEFAULT_FILTERS,
   EMERGENCY_RE,
   OTHER_CONCERN,
   availableDays,
+  ensureOptionClinic,
   findClinics,
+  filtersLabel,
   matchConcern,
-  parseBudget,
+  parseFilters,
   timeSlots,
-  type Budget,
+  type Filters,
   type ClinicOption,
   type DayChoice,
   type SpecialtyTag,
@@ -33,6 +36,7 @@ import {
   BookingSummaryCard,
   ClinicCards,
   EmergencyCard,
+  FiltersCard,
   MedicineCard,
   ReportCard,
   RichText,
@@ -44,6 +48,7 @@ import {
 // ── Types ──
 type Card =
   | { type: "clinics"; options: ClinicOption[]; startIndex: number }
+  | { type: "filters"; initial: Filters }
   | { type: "summary"; draft: BookingDraft; booked?: boolean; patientId?: string }
   | { type: "medicine"; data: MedicineInfo; showLinks: boolean }
   | { type: "report"; analysis: string }
@@ -65,17 +70,14 @@ type NewMsg = Omit<Msg, "id" | "time" | "turn">;
 
 type Step =
   | "menu" | "free"
-  | "book_concern" | "book_symptom" | "book_budget" | "book_pick" | "book_day" | "book_period" | "book_time" | "book_confirm" | "book_done"
+  | "book_concern" | "book_filters" | "book_pick" | "book_day" | "book_period" | "book_time" | "book_confirm" | "book_done"
   | "med_name" | "med_rx" | "med_after"
   | "report_how" | "report_text" | "report_after";
 
 type Ctx = {
   concern?: { tag: SpecialtyTag; specialist: string };
   concernLabel?: string;
-  symptomIdx?: number;
-  answers?: Record<string, string>;
-  urgent?: boolean;
-  budget?: Budget;
+  filters?: Filters;
   results: ClinicOption[];
   shown: number;
   option?: ClinicOption;
@@ -98,7 +100,7 @@ const CHANGE_TIME = "🕒 Change time";
 const CHANGE_CLINIC = "🏥 Change clinic";
 const CHANGE_DAY = "📅 Change day";
 const SHOW_MORE = "🔄 Show more clinics";
-const CHANGE_BUDGET = "💰 Change budget";
+const CHANGE_FILTERS = "🎚️ Change filters";
 const ANOTHER_MED = "🔄 Check another medicine";
 const UPLOAD_RX = "📤 Upload prescription";
 const CONSULT = "🩺 Consult a doctor";
@@ -109,16 +111,6 @@ const ANOTHER_REPORT = "🔬 Analyse another report";
 const LOGIN = "🔐 Log in";
 const CONTINUE = "↩️ Continue";
 const POPULAR_MEDICINES = ["Dolo 650", "Cetirizine", "Digene", "Vitamin D3", "Azithromycin"];
-const SKIP_QUESTIONS = "⏭️ Skip questions";
-
-// investigateSymptom — 5 quick questions: duration → severity → cause → history → age
-const SYMPTOM_QUESTIONS: { key: string; label: string; q: string; chips: string[] }[] = [
-  { key: "duration", label: "Duration", q: "How long have you had this?", chips: ["Since today", "2–3 days", "About a week", "More than a week"] },
-  { key: "severity", label: "Severity", q: "How bad is it right now?", chips: ["😊 Mild", "😐 Moderate", "😣 Severe"] },
-  { key: "cause", label: "Possible trigger", q: "Do you know what might have triggered it?", chips: ["Not sure", "Weather change", "Food / water", "Injury / strain", "Stress / poor sleep", "Someone nearby has it"] },
-  { key: "history", label: "History", q: "Have you had this before, or do you have any ongoing conditions?", chips: ["First time", "Happened before", "Diabetes", "High BP", "Asthma", "None of these"] },
-  { key: "age", label: "Age", q: "What is the patient's age?", chips: ["Under 12", "12–17", "18–40", "41–60", "Above 60"] },
-];
 
 // askTimeSlot — part of the day first, then the exact slot
 const PERIODS = [
@@ -129,7 +121,7 @@ const PERIODS = [
 
 const MENU_LIKE: Step[] = ["menu", "free", "book_done", "med_after", "report_after"];
 // Steps that expect free text (a concern, a medicine name, report values)
-const FREE_TEXT_STEPS: Step[] = ["book_concern", "book_symptom", "med_name", "report_text"];
+const FREE_TEXT_STEPS: Step[] = ["book_concern", "med_name", "report_text"];
 const HISTORY_LIMIT = 10;
 
 function greetingText(name: string) {
@@ -311,8 +303,7 @@ export default function MediflowChat({
 
     switch (step) {
       case "book_concern": return onConcern(text);
-      case "book_symptom": return onSymptom(text, n);
-      case "book_budget": return onBudget(text);
+      case "book_filters": return onFilters(text);
       case "book_pick": return onPick(n);
       case "book_day": return onDay(n);
       case "book_period": return onPeriod(n);
@@ -344,7 +335,7 @@ export default function MediflowChat({
   async function reask() {
     const c = ctx.current;
     switch (stepRef.current) {
-      case "book_budget": return askBudget();
+      case "book_filters": return askFilters();
       case "book_pick": return bot(say("Which clinic would you like to book?", pickChips()));
       case "book_day": return bot(say("Which day works best for you?", [...c.days.map((d) => d.label), CHANGE_CLINIC]));
       case "book_period": return askPeriod();
@@ -427,72 +418,36 @@ export default function MediflowChat({
     const c = ctx.current;
     c.concern = { tag: concern.tag, specialist: concern.specialist };
     c.concernLabel = concern.label.replace(/^\P{L}+/u, "");
-    c.symptomIdx = 0;
-    c.answers = {};
-    stepRef.current = "book_symptom";
-    const q = SYMPTOM_QUESTIONS[0];
-    await bot(
-      say(`${lead}I'll ask ${SYMPTOM_QUESTIONS.length} quick questions so the doctor knows what's going on 📝`),
-      say(q.q, [...q.chips, SKIP_QUESTIONS])
-    );
-  }
-
-  // investigateSymptom: duration → severity → cause → history → age
-  async function onSymptom(text: string, n: string) {
-    const c = ctx.current;
-    const idx = c.symptomIdx ?? 0;
-    if (n === normalize(SKIP_QUESTIONS)) return finishSymptoms();
-    c.answers = { ...c.answers, [SYMPTOM_QUESTIONS[idx].key]: text.replace(/^\P{L}+/u, "") };
-    c.symptomIdx = idx + 1;
-    if (c.symptomIdx >= SYMPTOM_QUESTIONS.length) return finishSymptoms();
-    const q = SYMPTOM_QUESTIONS[c.symptomIdx];
-    await bot(say(q.q, q.chips));
-  }
-
-  async function finishSymptoms() {
-    const c = ctx.current;
-    const a = c.answers ?? {};
-    let concern = c.concern ?? { tag: "General" as SpecialtyTag, specialist: "General Physician" };
-    const notes: string[] = [];
-
-    // suggestSpecialty: children see a Pediatrician unless it's teeth / eyes / skin
-    if (a.age === "Under 12" && !["Dental", "Eye", "Skin", "Pediatric"].includes(concern.tag)) {
-      concern = { tag: "Pediatric", specialist: "Pediatrician" };
-    }
-    c.concern = concern;
-    c.urgent = /severe/i.test(a.severity || "") || (/more than a week/i.test(a.duration || "") && /above 60/i.test(a.age || ""));
-    if (c.urgent) notes.push("Since it's quite bad, I'll show clinics with the shortest wait first ⏱");
-    if (/more than a week/i.test(a.duration || "")) notes.push("It's been over a week, so it's good you're getting it checked 👍");
-
     const art = article(concern.specialist);
-    const lead = Object.keys(a).length
-      ? `Thanks for sharing that 🙏 Based on what you've told me, ${art} **${concern.specialist}** is the right doctor for this.`
-      : `No problem! ${art[0].toUpperCase()}${art.slice(1)} **${concern.specialist}** is the right doctor for this.`;
-    await askBudget([lead, ...notes].join("\n"));
+    await askFilters(`${lead}${art[0].toUpperCase()}${art.slice(1)} **${concern.specialist}** is the right doctor for this.`);
   }
 
   /** One-line summary saved with the appointment for the doctor. */
   function symptomSummary() {
-    const c = ctx.current;
-    const a = c.answers ?? {};
-    const parts = SYMPTOM_QUESTIONS.filter((q) => a[q.key]).map((q) => `${q.label}: ${a[q.key]}`);
-    return [c.concernLabel, ...parts].filter(Boolean).join(" · ");
+    return ctx.current.concernLabel ?? "";
   }
 
-  async function askBudget(lead?: string) {
-    stepRef.current = "book_budget";
+  async function askFilters(lead?: string) {
+    stepRef.current = "book_filters";
     const parts: NewMsg[] = [];
     if (lead) parts.push(say(lead));
-    parts.push(say("What's your budget for the consultation fee?", BUDGETS.map((b) => b.label)));
+    parts.push(
+      say("Set your consultation fee and rating, then tap **Show clinics** 👇"),
+      { role: "bot", card: { type: "filters", initial: ctx.current.filters ?? DEFAULT_FILTERS } }
+    );
     await bot(...parts);
   }
 
-  async function onBudget(text: string) {
-    const budget = parseBudget(text);
-    if (!budget) {
-      return bot(say("Sorry, I didn't catch that. What's your budget for the consultation fee?", BUDGETS.map((b) => b.label)));
+  async function onFilters(text: string) {
+    const filters = parseFilters(text);
+    if (!filters) {
+      return bot(say("Sorry, I didn't catch that. Use the slider above, or type something like “under ₹800, 4 star”."));
     }
-    ctx.current.budget = budget;
+    return applyFilters(filters);
+  }
+
+  async function applyFilters(filters: Filters) {
+    ctx.current.filters = filters;
     await searchClinics();
   }
 
@@ -500,19 +455,23 @@ export default function MediflowChat({
     const c = ctx.current;
     const concern = c.concern ?? { tag: "General" as SpecialtyTag, specialist: "General Physician" };
     const loc = locRef.current ?? (await requestLocation());
-    const result = await findClinics(concern.tag, concern.specialist, c.budget ?? BUDGETS[3], loc);
-    // Urgent cases: shortest wait first (stable, so distance/rating order is kept for ties)
-    c.results = c.urgent ? [...result.options].sort((x, y) => x.waitMins - y.waitMins) : result.options;
+    if (!loc) {
+      stepRef.current = "book_filters";
+      return bot(
+        say("I need your location to find real clinics near you 📍 Please allow location access in your browser (or tap “Enable location” at the top), then tap **Show clinics** again."),
+        { role: "bot", card: { type: "filters", initial: c.filters ?? DEFAULT_FILTERS } }
+      );
+    }
+    const result = await findClinics(concern.tag, concern.specialist, c.filters ?? DEFAULT_FILTERS, loc);
+    // Urgent cases: strictly nearest first
+    c.results = result.options;
     c.shown = 0;
     if (!result.options.length) {
-      stepRef.current = "book_budget";
-      return bot(say("Sorry, I couldn't find any clinics for that right now 😕 Would you like to try a different budget?", BUDGETS.map((b) => b.label)));
+      return askFilters("Sorry, I couldn't find any clinics for that right now 😕 Try changing the filters.");
     }
-    const area = locationLabel(loc);
-    const withinBudget = c.budget?.max != null ? ", within your budget" : "";
-    const intro = area
-      ? `Here are the best matches near ${area}${withinBudget} 👇`
-      : `Here are the top-rated clinics${withinBudget} 👇 (turn on location to see the nearest ones)`;
+    const area = locationLabel(loc) || "you";
+    const filtered = c.filters && (c.filters.maxFee != null || c.filters.minRating != null) && !result.note ? ", matching your filters" : "";
+    const intro = `Here are real clinics near ${area}${filtered} 👇`;
     await showResults(result.note ? `${intro}\n\n${result.note}` : intro);
   }
 
@@ -533,7 +492,7 @@ export default function MediflowChat({
     const c = ctx.current;
     const chips = c.results.slice(0, c.shown).map((_, i) => `Book Option ${i + 1}`);
     if (c.shown < c.results.length) chips.push(SHOW_MORE);
-    chips.push(CHANGE_BUDGET);
+    chips.push(CHANGE_FILTERS);
     return chips;
   }
 
@@ -543,13 +502,15 @@ export default function MediflowChat({
       if (c.shown < c.results.length) return showResults("Here are more options 👇");
       return bot(say("That's every clinic I have for this right now. Which clinic would you like to book?", pickChips()));
     }
-    if (has(n, "change budget", "budget")) return askBudget();
+    if (has(n, "change filters", "filters", "filter", "change budget", "budget")) return askFilters();
 
     const words: Record<string, number> = { first: 1, one: 1, second: 2, two: 2, third: 3, three: 3, fourth: 4, four: 4 };
     let idx = Number(n.match(/\d+/)?.[0] ?? 0);
     if (!idx) for (const [w, v] of Object.entries(words)) if (n.split(" ").includes(w)) idx = v;
     if (!idx) {
-      const byName = c.results.slice(0, c.shown).findIndex((o) => n.includes(normalize(o.clinicName)) || n.includes(normalize(o.area)));
+      const byName = c.results
+        .slice(0, c.shown)
+        .findIndex((o) => n.includes(normalize(o.clinicName)) || (!!o.area && n.includes(normalize(o.area))));
       if (byName >= 0) idx = byName + 1;
     }
     const option = idx >= 1 && idx <= c.shown ? c.results[idx - 1] : null;
@@ -573,8 +534,8 @@ export default function MediflowChat({
     const day = c.days.find((d) => normalize(d.label) === n) ?? c.days.find((d) => n.includes(normalize(d.label)));
     if (!day || !c.option) return bot(say("Which day works best for you?", [...c.days.map((d) => d.label), CHANGE_CLINIC]));
     c.day = day;
-    // Hide slots that are already booked
-    const booked = new Set(await getBookedTimes(c.option.clinicId, c.option.doctorId, day.iso));
+    // Hide slots that are already booked (a map listing nobody has booked yet has none)
+    const booked = new Set(c.option.clinicId ? await getBookedTimes(c.option.clinicId, c.option.doctorId, day.iso) : []);
     c.daySlots = timeSlots(c.option, day.date).filter((s) => !booked.has(s));
     if (!c.daySlots.length) {
       return bot(say(`Sorry, ${day.label} is fully booked 😕 Which other day works for you?`, [...c.days.filter((d) => d !== day).map((d) => d.label), CHANGE_CLINIC]));
@@ -660,10 +621,18 @@ export default function MediflowChat({
     const { data: { user } } = await supabase.auth.getUser();
     if (!user) return bot(say("Please log in so I can save this booking to your account. Would you like to log in now?", [LOGIN, MAIN_MENU]));
 
-    // confirmBooking → createAppointment
+    // confirmBooking → save the map listing (first booking) → createAppointment
+    let clinicId: string;
+    try {
+      clinicId = await ensureOptionClinic(d.option);
+    } catch (e) {
+      console.warn("Saving clinic failed:", e);
+      const call = d.option.phone ? ` You can also call the clinic directly at ${d.option.phone}.` : "";
+      return bot(say(`I couldn't reserve this slot right now 😟${call} Would you like me to try again?`, [CONFIRM, MAIN_MENU]));
+    }
     const { error } = await createAppointment({
       patientId: user.id,
-      clinicId: d.option.clinicId,
+      clinicId,
       doctorId: d.option.doctorId,
       date: d.dateIso,
       time: d.time,
@@ -678,11 +647,18 @@ export default function MediflowChat({
     }
     if (error) {
       console.warn("Booking insert failed:", error);
-      return bot(say(`I couldn't save your booking 😟 You can also call the clinic directly at ${d.option.phone}. Would you like me to try again?`, [CONFIRM, MAIN_MENU]));
+      const call = d.option.phone ? ` You can also call the clinic directly at ${d.option.phone}.` : "";
+      return bot(say(`I couldn't save your booking 😟${call} Would you like me to try again?`, [CONFIRM, MAIN_MENU]));
     }
     stepRef.current = "book_done";
+    const confirmNote = d.option.onMediflow
+      ? "The clinic has your booking on its Mediflow dashboard ✅"
+      : d.option.phone
+      ? `Heads-up: ${d.option.clinicName} isn't on Mediflow yet, so please call ${d.option.phone} to confirm this slot 📞`
+      : `Heads-up: ${d.option.clinicName} isn't on Mediflow yet and hasn't listed a phone number — please confirm in person before you go.`;
     await bot(
       { role: "bot", card: { type: "summary", draft: d, booked: true, patientId: patient.current.patientId } },
+      say(confirmNote),
       say("You're all set! 🎉 Get well soon 💙 Is there anything else I can help you with?", [MENU.medicine, MENU.report, MAIN_MENU])
     );
   }
@@ -732,7 +708,7 @@ export default function MediflowChat({
     }
     if (has(n, "consult", "doctor", "no")) {
       ctx.current = { results: [], shown: 0, days: [], slots: [], concern: { tag: "General", specialist: "General Physician" } };
-      return askBudget("A **General Physician** can examine you and prescribe the right medicine.");
+      return askFilters("A **General Physician** can examine you and prescribe the right medicine.");
     }
     if (has(n, "another")) return askMedicineName();
     return bot(say("Do you have a valid prescription?", [UPLOAD_RX, CONSULT, ANOTHER_MED]));
@@ -801,6 +777,7 @@ export default function MediflowChat({
       bmi: null,
     });
     if (data.error || !data.analysis) throw new Error(data.error || "No analysis");
+    saveHealthReport(data.analysis, "chat");
     stepRef.current = "report_after";
     await bot(
       say("Here's what your report says 👇"),
@@ -846,6 +823,8 @@ export default function MediflowChat({
     switch (card.type) {
       case "clinics":
         return <ClinicCards options={card.options} startIndex={card.startIndex} active={active} onSelect={(_, n) => handle(`Book Option ${n}`)} />;
+      case "filters":
+        return <FiltersCard initial={card.initial} active={active} onApply={(f) => handle(filtersLabel(f), () => applyFilters(f))} />;
       case "summary":
         return <BookingSummaryCard draft={card.draft} booked={card.booked} patientId={card.patientId} />;
       case "medicine":

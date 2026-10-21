@@ -1,7 +1,18 @@
 "use client";
 
-import { Fragment, type ReactNode } from "react";
-import { pharmacyLinks, type ClinicOption } from "@/lib/chat/booking";
+import { Fragment, useState, type ReactNode } from "react";
+import {
+  FEE_LIMIT,
+  FEE_STEP,
+  RATING_CHOICES,
+  feeLabel,
+  pharmacyLinks,
+  type ClinicOption,
+  type Filters,
+} from "@/lib/chat/booking";
+import { fetchedAt, rupee, type PriceOffer } from "@/lib/medicine";
+import { describeHours } from "@/lib/schedule";
+import { directionsUrl, telHref } from "@/lib/places";
 
 // ── Shared types ──
 export type MedicineInfo = {
@@ -11,10 +22,11 @@ export type MedicineInfo = {
   category?: string;
   requires_prescription?: boolean;
   uses?: string;
-  allopathy?: { name: string; works_in: string; typical_price: string; side_effects: string; avoid_if: string };
-  ayurvedic?: { name: string; works_in: string; typical_price: string; note: string } | null;
+  allopathy?: { name: string; works_in: string; side_effects: string; avoid_if: string; price?: string | null; prices?: PriceOffer[] };
+  ayurvedic?: { name: string; works_in: string; note: string; price?: string | null; prices?: PriceOffer[] } | null;
   advice?: string;
   search_term?: string;
+  prices_fetched_at?: number | null;
 };
 
 export type BookingDraft = {
@@ -59,6 +71,91 @@ function Row({ label, value, strong }: { label: string; value: ReactNode; strong
   );
 }
 
+// ── Clinic filters (fee slider + minimum rating) ──
+const FEE_PRESETS = [500, 1000, 2000, FEE_LIMIT];
+
+export function FiltersCard({
+  initial,
+  active,
+  onApply,
+}: {
+  initial: Filters;
+  active: boolean;
+  onApply: (f: Filters) => void;
+}) {
+  const [fee, setFee] = useState(initial.maxFee ?? FEE_LIMIT);
+  const [minRating, setMinRating] = useState<number | null>(initial.minRating);
+  const pct = (fee / FEE_LIMIT) * 100;
+
+  return (
+    <Card className={`w-full ${active ? "" : "opacity-60"}`}>
+      <fieldset disabled={!active} className="px-3.5 pt-3.5 pb-3 space-y-4">
+        <div>
+          <div className="flex items-baseline justify-between">
+            <p className="text-[13px] font-semibold text-slate-700">Consultation fee</p>
+            <p className="text-base font-bold text-sky-600">{feeLabel(fee)}</p>
+          </div>
+          <input
+            type="range"
+            min={0}
+            max={FEE_LIMIT}
+            step={FEE_STEP}
+            value={fee}
+            onChange={(e) => setFee(Number(e.target.value))}
+            aria-label="Maximum consultation fee"
+            className="w-full mt-2 h-2 rounded-full appearance-none cursor-pointer accent-sky-600 disabled:cursor-default"
+            style={{ background: `linear-gradient(to right, #0284c7 ${pct}%, #e2e8f0 ${pct}%)` }}
+          />
+          <div className="flex justify-between text-[10px] text-slate-400 mt-1">
+            <span>₹0</span>
+            <span>₹10,000+</span>
+          </div>
+          <div className="flex gap-1.5 mt-2">
+            {FEE_PRESETS.map((v) => (
+              <button
+                key={v}
+                type="button"
+                onClick={() => setFee(v)}
+                className={`flex-1 text-[11px] font-medium rounded-lg py-1.5 border transition-colors ${
+                  fee === v ? "bg-sky-600 border-sky-600 text-white" : "border-slate-200 text-slate-600 hover:border-sky-300"
+                }`}
+              >
+                {v >= FEE_LIMIT ? "Any" : `≤ ₹${v.toLocaleString("en-IN")}`}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div>
+          <p className="text-[13px] font-semibold text-slate-700">Minimum rating</p>
+          <div className="flex gap-1.5 mt-2">
+            {RATING_CHOICES.map((r) => (
+              <button
+                key={r ?? "any"}
+                type="button"
+                onClick={() => setMinRating(r)}
+                className={`flex-1 text-xs font-medium rounded-lg py-1.5 border transition-colors ${
+                  minRating === r ? "bg-amber-400 border-amber-400 text-slate-900" : "border-slate-200 text-slate-600 hover:border-amber-300"
+                }`}
+              >
+                {r == null ? "Any" : `${r}★+`}
+              </button>
+            ))}
+          </div>
+          <p className="text-[10px] text-slate-400 mt-1.5">Uses the doctor&apos;s rating where we have it, otherwise the clinic&apos;s.</p>
+        </div>
+      </fieldset>
+      <button
+        onClick={() => onApply({ maxFee: fee >= FEE_LIMIT ? null : fee, minRating })}
+        disabled={!active}
+        className="w-full bg-sky-600 hover:bg-sky-700 disabled:bg-slate-300 text-white text-sm font-semibold py-2.5 transition-colors"
+      >
+        Show clinics
+      </button>
+    </Card>
+  );
+}
+
 // ── Clinic results ──
 export function ClinicCards({
   options,
@@ -81,13 +178,13 @@ export function ClinicCards({
                 <p className="text-[10px] font-semibold uppercase tracking-wide text-sky-600">Option {startIndex + i + 1}</p>
                 <p className="font-semibold text-slate-800 text-[15px] leading-tight truncate">🏥 {o.clinicName}</p>
                 <p className="text-xs text-slate-500 mt-0.5">
-                  📍 {o.area}
+                  📍 {o.area || o.address}
                   {o.distanceKm != null && ` · ${o.distanceKm} km away`}
                 </p>
               </div>
               <div className="text-right flex-shrink-0">
                 <p className="text-lg font-bold text-slate-800 leading-none">₹{o.fee}</p>
-                <p className="text-[10px] text-slate-400 mt-0.5">consultation</p>
+                <p className="text-[10px] text-slate-400 mt-0.5">{o.feeEstimated ? "approx. fee" : "consultation"}</p>
               </div>
             </div>
             <div className="mt-2.5 flex items-center gap-2.5 bg-slate-50 rounded-xl px-2.5 py-2">
@@ -103,10 +200,18 @@ export function ClinicCards({
                 </p>
               </div>
             </div>
-            <div className="mt-2 flex items-center gap-3 text-xs text-slate-600">
-              <span>⭐ {o.rating} <span className="text-slate-400">({o.reviews})</span></span>
-              <span>⏱ ~{o.waitMins} min wait</span>
+            <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-600">
+              {o.onMediflow ? (
+                <span className="font-semibold text-emerald-600">✓ Books instantly on Mediflow</span>
+              ) : (
+                <span className="text-slate-500">Map listing · call to confirm</span>
+              )}
+              {o.rating != null && (
+                <span>⭐ {o.rating}{o.reviews != null && <span className="text-slate-400"> ({o.reviews})</span>}</span>
+              )}
+              {o.waitMins != null && <span>⏱ ~{o.waitMins} min wait</span>}
             </div>
+            <p className="mt-1 text-[11px] text-slate-400">🕒 {o.hoursKnown ? describeHours(o.hours) : "Hours not listed — usual clinic hours shown"}</p>
           </div>
           <button
             onClick={() => onSelect(o, startIndex + i + 1)}
@@ -135,13 +240,23 @@ export function BookingSummaryCard({ draft, booked, patientId }: { draft: Bookin
         <Row label="Date" value={draft.dayLabel} />
         <Row label="Time" value={draft.time} />
         <Row label="Address" value={o.address} />
-        <Row label="Fee" value={`₹${o.fee} (pay at clinic)`} strong />
+        <Row label="Fee" value={`₹${o.fee}${o.feeEstimated ? " approx." : ""} (pay at clinic)`} strong />
         {booked && patientId && <Row label="Patient ID" value={patientId} />}
       </div>
       {booked && (
-        <p className="px-3.5 pb-3 text-xs text-slate-500">
-          Show your Mediflow Patient ID at reception. Clinic phone: {o.phone}
-        </p>
+        <div className="px-3.5 pb-3">
+          <p className="text-xs text-slate-500">Show your Mediflow Patient ID at reception.</p>
+          <div className="flex gap-2 mt-2">
+            {o.phone && (
+              <a href={telHref(o.phone)} className="flex-1 text-center text-xs font-semibold border border-sky-200 text-sky-600 rounded-lg py-2">
+                📞 Call clinic
+              </a>
+            )}
+            <a href={directionsUrl(o)} target="_blank" rel="noopener noreferrer" className="flex-1 text-center text-xs font-semibold border border-sky-200 text-sky-600 rounded-lg py-2">
+              🗺️ Directions
+            </a>
+          </div>
+        </div>
       )}
     </Card>
   );
@@ -174,7 +289,7 @@ export function MedicineCard({ data, showLinks }: { data: MedicineInfo; showLink
         <div className="mx-3.5 mb-2 rounded-xl bg-sky-50 px-3 py-2">
           <p className="text-xs font-semibold text-sky-700 mb-1">💊 Allopathy — {data.allopathy.name}</p>
           <Row label="Works in" value={data.allopathy.works_in} />
-          <Row label="Price" value={data.allopathy.typical_price} />
+          <Row label="Live price" value={data.allopathy.price || "Not listed online"} />
           <Row label="Side effects" value={data.allopathy.side_effects} />
           <Row label="Avoid if" value={data.allopathy.avoid_if} />
         </div>
@@ -184,12 +299,21 @@ export function MedicineCard({ data, showLinks }: { data: MedicineInfo; showLink
         <div className="mx-3.5 mb-2 rounded-xl bg-emerald-50 px-3 py-2">
           <p className="text-xs font-semibold text-emerald-700 mb-1">🌿 Ayurvedic — {data.ayurvedic.name}</p>
           <Row label="Works in" value={data.ayurvedic.works_in} />
-          <Row label="Price" value={data.ayurvedic.typical_price} />
+          <Row label="Live price" value={data.ayurvedic.price || "Not listed online"} />
           <p className="text-xs text-slate-600 pt-1">{data.ayurvedic.note}</p>
         </div>
       )}
 
-      {showLinks && (
+      {showLinks && !!data.allopathy?.prices?.length && (
+        <div className="px-3.5 pb-2">
+          <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400 mb-1.5">
+            Today&apos;s prices{data.prices_fetched_at ? ` · checked ${fetchedAt(data.prices_fetched_at)}` : ""}
+          </p>
+          <OfferList offers={data.allopathy.prices} />
+        </div>
+      )}
+
+      {showLinks && !data.allopathy?.prices?.length && (
         <div className="px-3.5 pb-2">
           <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400 mb-1.5">Compare & order</p>
           <div className="grid grid-cols-3 gap-1.5">
@@ -212,6 +336,34 @@ export function MedicineCard({ data, showLinks }: { data: MedicineInfo; showLink
         {data.advice && <>{data.advice} · </>}⚕️ Please consult a doctor before taking any medicine.
       </p>
     </Card>
+  );
+}
+
+/** Live offers, cheapest first — each row names the exact product the price is for. */
+export function OfferList({ offers }: { offers: PriceOffer[] }) {
+  return (
+    <div className="space-y-1.5">
+      {offers.map((p, j) => (
+        <a
+          key={`${p.platform}-${p.url}`}
+          href={p.url}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="flex items-center justify-between gap-2 border border-slate-100 rounded-lg px-2.5 py-1.5 hover:border-sky-300 hover:bg-sky-50 transition-colors"
+        >
+          <div className="min-w-0">
+            <p className="text-xs font-semibold text-slate-700">{p.platform_name}</p>
+            <p className="text-[11px] text-slate-400 truncate">{p.name}{p.pack && ` · ${p.pack}`}</p>
+          </div>
+          <div className="text-right flex-shrink-0">
+            <p className={`text-sm font-bold ${j === 0 ? "text-emerald-600" : "text-slate-800"}`}>{rupee(p.price)}</p>
+            {p.mrp != null && p.discount_pct > 0 && (
+              <p className="text-[10px] text-slate-400"><s>{rupee(p.mrp)}</s> · {p.discount_pct}% off</p>
+            )}
+          </div>
+        </a>
+      ))}
+    </div>
   );
 }
 

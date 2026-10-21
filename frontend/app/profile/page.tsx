@@ -13,7 +13,9 @@ import {
   rescheduleAppointment,
   type Appointment,
 } from "@/lib/appointments";
-import { formatSlot } from "@/lib/chat/booking";
+import { hoursFromRange, timeSlots, type Hours } from "@/lib/schedule";
+import { deleteHealthReport, listHealthReports, type HealthReport } from "@/lib/reports";
+import { ReportCard } from "@/components/chat/cards";
 import MediPassSection from "@/components/profile/MediPassSection";
 import DeleteAccount from "@/components/profile/DeleteAccount";
 
@@ -30,13 +32,17 @@ function nextDays(count = 7): DayOpt[] {
   return out;
 }
 
-function slotsFor(iso: string) {
-  const now = new Date();
-  const isToday = iso === nextDays(1)[0].iso;
-  const earliest = isToday ? now.getHours() * 60 + now.getMinutes() + 45 : 0;
-  const slots: string[] = [];
-  for (let t = 9 * 60; t <= 20 * 60; t += 60) if (t >= earliest) slots.push(formatSlot(t));
-  return slots;
+/** Slots from the clinic's real opening hours. */
+function slotsFor(iso: string, hours: Hours | null, slotMinutes: number) {
+  return timeSlots(hours, new Date(iso + "T00:00"), slotMinutes);
+}
+
+type ClinicHours = { hours: Hours | null; slotMinutes: number };
+
+async function clinicHours(clinicId: string): Promise<ClinicHours> {
+  const { data } = await supabase.from("clinics").select("hours, open_time, close_time, slot_minutes").eq("id", clinicId).maybeSingle();
+  const c = data as { hours?: Hours | null; open_time?: string | null; close_time?: string | null; slot_minutes?: number | null } | null;
+  return { hours: c?.hours ?? hoursFromRange(c?.open_time, c?.close_time), slotMinutes: c?.slot_minutes ?? 30 };
 }
 
 function prettyDate(iso: string) {
@@ -47,6 +53,8 @@ const STATUS_STYLE: Record<string, string> = {
   confirmed: "bg-emerald-50 text-emerald-700",
   cancelled: "bg-red-50 text-red-600",
   completed: "bg-gray-100 text-gray-600",
+  arrived: "bg-sky-50 text-sky-700",
+  no_show: "bg-amber-50 text-amber-700",
 };
 
 export default function ProfilePage() {
@@ -65,7 +73,9 @@ export default function ProfilePage() {
 
   // cancel / reschedule UI
   const [confirmCancel, setConfirmCancel] = useState<string | null>(null);
-  const [resched, setResched] = useState<{ id: string; date: string; time: string; booked: string[] } | null>(null);
+  const [resched, setResched] = useState<({ id: string; date: string; time: string; booked: string[] } & ClinicHours) | null>(null);
+  const [reports, setReports] = useState<HealthReport[]>([]);
+  const [openReport, setOpenReport] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [toast, setToast] = useState("");
   const [idCopied, setIdCopied] = useState(false);
@@ -93,6 +103,7 @@ export default function ProfilePage() {
       }
       setLoading(false);
       loadAppointments(user.id);
+      listHealthReports().then(setReports);
     })();
   }, [router]);
 
@@ -113,14 +124,17 @@ export default function ProfilePage() {
 
   async function openReschedule(a: Appointment) {
     setConfirmCancel(null);
-    const date = a.appointment_date >= nextDays(1)[0].iso ? a.appointment_date : nextDays(1)[0].iso;
+    const ch = await clinicHours(a.clinic_id);
+    const open = nextDays().filter((d) => slotsFor(d.iso, ch.hours, ch.slotMinutes).length);
+    const date = open.find((d) => d.iso === a.appointment_date)?.iso ?? open[0]?.iso ?? nextDays(1)[0].iso;
     const booked = await getBookedTimes(a.clinic_id, a.doctor_id, date);
-    setResched({ id: a.id, date, time: "", booked: booked.filter((t) => !(date === a.appointment_date && t === a.appointment_time)) });
+    setResched({ id: a.id, date, time: "", ...ch, booked: booked.filter((t) => !(date === a.appointment_date && t === a.appointment_time)) });
   }
 
   async function pickReschedDate(a: Appointment, date: string) {
+    if (!resched) return;
     const booked = await getBookedTimes(a.clinic_id, a.doctor_id, date);
-    setResched({ id: a.id, date, time: "", booked: booked.filter((t) => !(date === a.appointment_date && t === a.appointment_time)) });
+    setResched({ ...resched, date, time: "", booked: booked.filter((t) => !(date === a.appointment_date && t === a.appointment_time)) });
   }
 
   async function doReschedule() {
@@ -280,7 +294,7 @@ export default function ProfilePage() {
                   <div className="mt-3 bg-sky-50 rounded-xl p-3 space-y-3">
                     <p className="text-xs font-semibold text-sky-700 uppercase tracking-wide">Pick a new date</p>
                     <div className="flex gap-2 overflow-x-auto pb-1">
-                      {nextDays().map((d) => (
+                      {nextDays().filter((d) => slotsFor(d.iso, resched.hours, resched.slotMinutes).length).map((d) => (
                         <button key={d.iso} onClick={() => pickReschedDate(a, d.iso)}
                           className={`flex-shrink-0 px-3 py-1.5 rounded-full text-xs border ${resched.date === d.iso ? "bg-sky-500 text-white border-sky-500" : "bg-white text-gray-600 border-gray-200"}`}>
                           {d.label}
@@ -289,7 +303,7 @@ export default function ProfilePage() {
                     </div>
                     <p className="text-xs font-semibold text-sky-700 uppercase tracking-wide">Pick a time</p>
                     <div className="grid grid-cols-3 sm:grid-cols-4 gap-2">
-                      {slotsFor(resched.date).filter((t) => !resched.booked.includes(t)).map((t) => (
+                      {slotsFor(resched.date, resched.hours, resched.slotMinutes).filter((t) => !resched.booked.includes(t)).map((t) => (
                         <button key={t} onClick={() => setResched({ ...resched, time: t })}
                           className={`py-1.5 rounded-lg text-xs border ${resched.time === t ? "bg-sky-500 text-white border-sky-500" : "bg-white text-gray-600 border-gray-200 hover:border-sky-300"}`}>
                           {t}
@@ -362,6 +376,37 @@ export default function ProfilePage() {
             </button>
             {statsMsg && <p className="text-xs text-gray-500">{statsMsg}</p>}
           </div>
+        </section>
+
+        {/* Saved report analyses */}
+        <section className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="font-bold text-gray-800">My Health Reports</h2>
+            <Link href="/chat?start=report" className="text-xs text-sky-600 font-medium">+ Analyse a report</Link>
+          </div>
+          {reports.length === 0 ? (
+            <p className="text-sm text-gray-400">No reports yet — upload a blood test and the AI analysis is saved here.</p>
+          ) : (
+            <div className="divide-y divide-gray-100">
+              {reports.map((r) => (
+                <div key={r.id} className="py-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <button onClick={() => setOpenReport(openReport === r.id ? null : r.id)} className="text-left min-w-0">
+                      <p className="text-sm font-medium text-gray-800 truncate">🔬 {r.title || "Health report"}</p>
+                      <p className="text-xs text-gray-400">{prettyDate(r.created_at.slice(0, 10))} · {r.source === "fitness" ? "Fitness" : "Chat"}</p>
+                    </button>
+                    <button
+                      onClick={async () => { await deleteHealthReport(r.id); setReports((x) => x.filter((y) => y.id !== r.id)); }}
+                      className="text-xs text-gray-400 hover:text-red-600 flex-shrink-0"
+                    >
+                      Delete
+                    </button>
+                  </div>
+                  {openReport === r.id && <div className="mt-2"><ReportCard analysis={r.analysis} /></div>}
+                </div>
+              ))}
+            </div>
+          )}
         </section>
 
         {/* Past appointments */}

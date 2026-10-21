@@ -20,6 +20,8 @@ import {
 } from "@/lib/clinic";
 import { dispatchAmbulance, type EmergencyCase } from "@/lib/emergency";
 import { todayIso } from "@/lib/appointments";
+import ClinicSettings from "@/components/clinic/ClinicSettings";
+import DoctorsManager from "@/components/clinic/DoctorsManager";
 
 const REASSIGN_AFTER_S = 180;
 
@@ -60,6 +62,7 @@ export default function ClinicPortal() {
   const [medipass, setMedipass] = useState<PatientCard | null>(null);
   const [toast, setToast] = useState("");
   const [soundOn, setSoundOn] = useState(false);
+  const [tab, setTab] = useState<"appointments" | "doctors" | "settings">("appointments");
   const audio = useRef<AudioContext | null>(null);
 
   const clinic = clinics.find((c) => c.id === clinicId);
@@ -154,7 +157,7 @@ export default function ClinicPortal() {
     }
   }
 
-  async function mark(id: string, status: "arrived" | "no_show" | "completed") {
+  async function mark(id: string, status: "arrived" | "no_show" | "completed" | "cancelled") {
     try {
       await markAppointment(id, status);
       load();
@@ -170,8 +173,11 @@ export default function ClinicPortal() {
     return (
       <div className="min-h-screen flex items-center justify-center bg-slate-50 px-6">
         <div className="bg-white border border-slate-200 rounded-2xl p-6 max-w-sm text-center">
-          <p className="font-semibold text-slate-800 mb-2">This account isn&apos;t linked to a clinic</p>
-          <p className="text-sm text-slate-500 mb-4">Ask Mediflow to link your login to your clinic, then sign in again.</p>
+          <p className="font-semibold text-slate-800 mb-2">This account isn&apos;t linked to a clinic yet</p>
+          <p className="text-sm text-slate-500 mb-4">Register your clinic (free) — find it on the map or add it, and bookings start appearing here.</p>
+          <button onClick={() => router.push("/clinic/signup")} className="w-full bg-slate-900 text-white text-sm font-semibold py-2.5 rounded-xl mb-3">
+            Register my clinic
+          </button>
           <button
             onClick={async () => { await supabase.auth.signOut(); router.push("/clinic/login"); }}
             className="text-sm text-sky-600 font-medium"
@@ -259,16 +265,39 @@ export default function ClinicPortal() {
           </section>
         )}
 
+        {/* ── TABS ── */}
+        <div className="flex gap-1 bg-white border border-slate-200 rounded-xl p-1 w-fit">
+          {([["appointments", "📅 Appointments"], ["doctors", "👨‍⚕️ Doctors"], ["settings", "⚙️ Clinic settings"]] as const).map(([id, label]) => (
+            <button key={id} onClick={() => setTab(id)}
+              className={`text-sm px-3 py-1.5 rounded-lg ${tab === id ? "bg-slate-900 text-white font-semibold" : "text-slate-600"}`}>
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {tab === "doctors" && <DoctorsManager clinicId={clinicId} onChange={load} />}
+        {tab === "settings" && <ClinicSettings clinicId={clinicId} onSaved={flash} />}
+
         {/* ── APPOINTMENTS ── */}
+        {tab === "appointments" && (
         <section className="bg-white rounded-2xl border border-slate-200 p-4">
           <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
-            <h2 className="font-bold text-slate-800">Appointments</h2>
-            <div className="flex gap-1 bg-slate-100 rounded-lg p-1">
-              {[["Today", todayIso()], ["Tomorrow", isoPlus(1)]].map(([label, iso]) => (
-                <button key={iso} onClick={() => setDate(iso)} className={`text-xs px-3 py-1.5 rounded-md ${date === iso ? "bg-white shadow-sm font-semibold text-slate-800" : "text-slate-500"}`}>
-                  {label}
-                </button>
-              ))}
+            <h2 className="font-bold text-slate-800">
+              Appointments{" "}
+              <span className="text-sm font-normal text-slate-400">
+                {appointments.filter((a) => a.status !== "cancelled").length} booked
+              </span>
+            </h2>
+            <div className="flex gap-1 bg-slate-100 rounded-lg p-1 overflow-x-auto max-w-full">
+              {Array.from({ length: 7 }, (_, i) => {
+                const iso = isoPlus(i);
+                const label = i === 0 ? "Today" : i === 1 ? "Tomorrow" : new Date(iso + "T00:00").toLocaleDateString("en-IN", { weekday: "short", day: "numeric" });
+                return (
+                  <button key={iso} onClick={() => setDate(iso)} className={`text-xs px-3 py-1.5 rounded-md whitespace-nowrap ${date === iso ? "bg-white shadow-sm font-semibold text-slate-800" : "text-slate-500"}`}>
+                    {label}
+                  </button>
+                );
+              })}
             </div>
           </div>
 
@@ -314,6 +343,8 @@ export default function ClinicPortal() {
                           <div className="flex gap-1.5">
                             <button onClick={() => mark(a.id, "arrived")} className="text-xs px-2.5 py-1 rounded-lg bg-emerald-500 text-white">Arrived</button>
                             <button onClick={() => mark(a.id, "no_show")} className="text-xs px-2.5 py-1 rounded-lg border border-slate-200 text-slate-600">No-show</button>
+                            <button onClick={() => { if (confirm("Cancel this appointment? The patient will see it as cancelled.")) mark(a.id, "cancelled"); }}
+                              className="text-xs px-2.5 py-1 rounded-lg border border-red-200 text-red-600">Cancel</button>
                           </div>
                         )}
                         {a.status === "arrived" && (
@@ -327,6 +358,7 @@ export default function ClinicPortal() {
             </div>
           )}
         </section>
+        )}
       </div>
 
       {medipass && <MediPassDrawer p={medipass} onClose={() => setMedipass(null)} />}

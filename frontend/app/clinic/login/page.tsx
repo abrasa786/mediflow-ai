@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabase";
 
@@ -18,7 +19,8 @@ export default function ClinicLogin() {
     const { error } = await supabase.auth.signInWithPassword({ email, password });
     setLoading(false);
     if (error) return setError(error.message);
-    router.push("/clinic");
+    const next = new URLSearchParams(window.location.search).get("next");
+    router.push(next?.startsWith("/clinic") ? next : "/clinic");
   }
 
   return (
@@ -37,6 +39,9 @@ export default function ClinicLogin() {
         <button disabled={loading} className="w-full bg-slate-900 text-white py-3 rounded-xl text-sm font-semibold disabled:opacity-50">
           {loading ? "Signing in…" : "Sign in"}
         </button>
+        <p className="text-center text-xs text-slate-500">
+          New clinic? <Link href="/clinic/signup" className="text-sky-600 font-medium">Register free →</Link>
+        </p>
       </form>
     </div>
   );

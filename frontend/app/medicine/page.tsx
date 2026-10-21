@@ -4,6 +4,9 @@ import { supabase } from "@/lib/supabase";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { ApiError, apiFetch } from "@/lib/api";
+import { OfferList } from "@/components/chat/cards";
+import { fetchedAt, type PriceOffer } from "@/lib/medicine";
+import { pharmacyLinks } from "@/lib/chat/booking";
 
 export default function Medicine() {
   const router = useRouter();
@@ -92,9 +95,9 @@ export default function Medicine() {
               <div className="space-y-2 text-xs text-blue-700">
                 <p>🔍 Search any medicine or symptom</p>
                 <p>📊 We compare ALL options — Allopathy, Ayurvedic, Homeopathy</p>
-                <p>💰 We show prices across 1mg, Netmeds, PharmEasy & local stores</p>
+                <p>💰 Live prices fetched right now from Tata 1mg, PharmEasy &amp; Netmeds</p>
                 <p>⚠️ We show side effects honestly — no hiding anything</p>
-                <p>🛒 Order directly — payment on our platform, delivered to you</p>
+                <p>🛒 Tap a price to order directly on that pharmacy&apos;s website</p>
               </div>
             </div>
           </>
@@ -105,7 +108,7 @@ export default function Medicine() {
           <div className="text-center py-16">
             <div className="w-10 h-10 border-2 border-blue-500 border-t-transparent rounded-full animate-spin mx-auto mb-4" />
             <p className="text-sm text-gray-500">Comparing all medicines transparently...</p>
-            <p className="text-xs text-gray-400 mt-1">Checking 1mg, Netmeds, PharmEasy & Ayurvedic options</p>
+            <p className="text-xs text-gray-400 mt-1">Checking live prices on 1mg, PharmEasy &amp; Netmeds</p>
           </div>
         )}
 
@@ -141,7 +144,10 @@ export default function Medicine() {
             {results.medicines && results.medicines.length > 0 && (
               <div className="bg-white rounded-2xl p-4 shadow-sm">
                 <p className="text-xs text-gray-500 uppercase tracking-wide font-medium mb-3">
-                  💰 Price Comparison & Order
+                  💰 Live Price Comparison & Order
+                  {results.prices_fetched_at && (
+                    <span className="normal-case tracking-normal font-normal text-gray-400"> · checked at {fetchedAt(results.prices_fetched_at)}</span>
+                  )}
                 </p>
                 <div className="space-y-3">
                   {results.medicines.map((med: any, i: number) => (
@@ -198,32 +204,33 @@ export default function Medicine() {
                         </div>
                       </div>
 
-                      {/* Platform prices + order */}
-                      {med.prices && med.prices.length > 0 && (
-                        <div className="border-t border-gray-100 px-4 py-3">
-                          <p className="text-xs text-gray-400 mb-2">Best prices — click to order</p>
-                          <div className="space-y-2">
-                            {med.prices.map((p: any, j: number) => (
-                              <div key={j} className="flex items-center justify-between">
-                                <div className="flex items-center gap-2">
-                                  <span className="text-xs font-medium text-gray-700 w-20">{p.platform}</span>
-                                  <span className="text-xs text-gray-400">{p.pack}</span>
-                                </div>
-                                <div className="flex items-center gap-2">
-                                  <span className={`text-sm font-bold ${j === 0 ? "text-green-600" : "text-gray-700"}`}>
-                                    {p.price}
-                                  </span>
-                                  {j === 0 && <span className="text-xs bg-green-100 text-green-600 px-1.5 py-0.5 rounded">Lowest</span>}
-                                  <a href={p.url} target="_blank" rel="noopener noreferrer"
-                                    className="bg-blue-600 text-white text-xs px-3 py-1.5 rounded-lg hover:bg-blue-700">
-                                    Order
-                                  </a>
-                                </div>
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-                      )}
+                      {/* Live platform prices + order */}
+                      <div className="border-t border-gray-100 px-4 py-3">
+                        {med.prices?.length > 0 ? (
+                          <>
+                            <p className="text-xs text-gray-400 mb-2">Today&apos;s prices, lowest first — tap to order</p>
+                            <OfferList offers={med.prices as PriceOffer[]} />
+                            {med.other_offers?.length > 0 && (
+                              <details className="mt-2">
+                                <summary className="text-xs text-blue-600 cursor-pointer">Other packs &amp; brands ({med.other_offers.length})</summary>
+                                <div className="mt-2"><OfferList offers={med.other_offers as PriceOffer[]} /></div>
+                              </details>
+                            )}
+                          </>
+                        ) : (
+                          <>
+                            <p className="text-xs text-gray-400 mb-2">Not found in online pharmacy listings right now — search directly:</p>
+                            <div className="grid grid-cols-3 gap-1.5">
+                              {pharmacyLinks(med.search_term || med.name).map((l) => (
+                                <a key={l.name} href={l.url} target="_blank" rel="noopener noreferrer"
+                                  className="text-center text-xs font-semibold text-blue-600 border border-blue-200 rounded-lg py-2 hover:bg-blue-50">
+                                  {l.name} ↗
+                                </a>
+                              ))}
+                            </div>
+                          </>
+                        )}
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -233,8 +240,8 @@ export default function Medicine() {
             {/* Disclaimer */}
             <div className="bg-yellow-50 border border-yellow-100 rounded-2xl p-4">
               <p className="text-xs text-yellow-700 leading-relaxed">
-                ⚠️ <strong>Mediflow Disclaimer:</strong> All medicine information is for educational purposes only. 
-                Prices are approximate and may vary. Always consult a qualified doctor before taking any medicine. 
+                ⚠️ <strong>Mediflow Disclaimer:</strong> Medicine information is AI-generated and for educational purposes only.
+                Prices are fetched live from each pharmacy and can change at checkout (offers, delivery fees). Always consult a qualified doctor before taking any medicine. 
                 Mediflow does not replace professional medical advice.
               </p>
             </div>

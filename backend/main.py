@@ -3,9 +3,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from groq import Groq
 from pypdf import PdfReader
+import asyncio
 import io
 import os
 import re
+import time
 import traceback
 import json
 
@@ -13,19 +15,23 @@ load_dotenv()
 
 # Imported after load_dotenv so they see the .env values
 from emergency import lifespan, router as emergency_router  # noqa: E402
+from facts import router as facts_router  # noqa: E402
+from pharmacy import price_line, router as pharmacy_router, search_prices  # noqa: E402
+from places import router as places_router  # noqa: E402
 from security import redact, require_user  # noqa: E402
 
 app = FastAPI(title="Mediflow AI Backend", lifespan=lifespan)
 
+# Website origins allowed to call the API — comma-separated, e.g.
+# ALLOWED_ORIGINS=https://mediflowai.in,https://www.mediflowai.in,https://clinic.mediflowai.in
+DEFAULT_ORIGINS = "http://localhost:3000,http://127.0.0.1:3000,https://mediflowai.in,https://www.mediflowai.in,https://clinic.mediflowai.in"
+ALLOWED_ORIGINS = [o.strip().rstrip("/") for o in (os.getenv("ALLOWED_ORIGINS") or DEFAULT_ORIGINS).split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "https://mediflowai.in",
-        "https://www.mediflowai.in",
-        "https://clinic.mediflowai.in",
-    ],
+    allow_origins=ALLOWED_ORIGINS,
+    # Vercel preview deployments (https://<project>-<hash>.vercel.app) when ALLOWED_ORIGIN_REGEX is set
+    allow_origin_regex=os.getenv("ALLOWED_ORIGIN_REGEX") or None,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -34,6 +40,9 @@ app.add_middleware(
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 app.include_router(emergency_router)
+app.include_router(places_router)
+app.include_router(pharmacy_router)
+app.include_router(facts_router)
 
 # Single model used by every endpoint
 MODEL = "openai/gpt-oss-20b"
@@ -110,12 +119,12 @@ STEP 4 — SHOW EXACTLY 2 CLINICS near their area, within their budget:
 
 🏥 Option 1 — {Clinic Name}
 👨‍⚕️ Dr. {Name} | {Specialty} | {X} yrs exp
-💰 ₹{fee} consultation | ⏱ ~{wait} min wait
+💰 ₹{fee} consultation
 ⭐ {rating}/5 ({reviews} reviews) | 📍 {X} km away
 
 🏥 Option 2 — {Clinic Name}
 👨‍⚕️ Dr. {Name} | {Specialty} | {X} yrs exp
-💰 ₹{fee} consultation | ⏱ ~{wait} min wait
+💰 ₹{fee} consultation
 ⭐ {rating}/5 ({reviews} reviews) | 📍 {X} km away
 
 "Which one works for you?"
@@ -160,18 +169,15 @@ STEP 2A — OTC MEDICINE:
 
 💊 Allopathy: {Brand}
 Active: {ingredient} | Works in: {time}
-Price: ~₹{X} for {qty}
 Side effects: {brief list}
 Avoid if: {conditions}
 
 🌿 Ayurvedic alternative: {name}
-Works in: {time} (gentler) | Price: ~₹{X}
+Works in: {time} (gentler)
 Good for: mild cases, if you prefer natural
 
-🛒 Order at the best price:
-• 1mg → https://www.1mg.com/search/all?name={medicine}
-• Netmeds → https://www.netmeds.com/search/result/{medicine}
-• PharmEasy → https://pharmeasy.in/search/all?name={medicine}
+🛒 Live prices: tap "💊 Order Medicine" to compare today's prices on 1mg, PharmEasy & Netmeds.
+NEVER state a medicine price yourself — prices change daily and the app fetches them live.
 
 ⚕️ Please consult a doctor before taking any medicine.
 [Ask about another medicine] [Book a doctor] [Go to Home]
@@ -181,7 +187,7 @@ STEP 2B — PRESCRIPTION MEDICINE:
 "What would you like to do?"
 [Upload prescription] [Book doctor] [Ask about alternatives]
 
-If upload → thank them, then share the 1mg / Netmeds / PharmEasy links as above.
+If upload → thank them, then suggest "💊 Order Medicine" to compare live prices.
 If book doctor → switch to MODULE 1.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -246,15 +252,12 @@ Respond ONLY with valid JSON in this exact format — no extra text:
       "evidence": "Strong or Moderate or Limited",
       "side_effects": "Honest list",
       "avoid": "Who should not take this",
-      "prices": [
-        {"platform": "1mg", "pack": "10 tablets", "price": "₹35", "url": "https://www.1mg.com/search/all?name=paracetamol"},
-        {"platform": "Netmeds", "pack": "10 tablets", "price": "₹32", "url": "https://www.netmeds.com/search/result/paracetamol"},
-        {"platform": "PharmEasy", "pack": "10 tablets", "price": "₹30", "url": "https://pharmeasy.in/search/all?name=paracetamol"}
-      ]
+      "search_term": "Exact product name as sold in Indian pharmacies, e.g. Dolo 650 or Patanjali Giloy Ghanvati"
     }
   ]
 }
-Always include one Ayurvedic option if it exists. Sort prices lowest to highest.
+Give 2–4 options. Always include one Ayurvedic option if it exists.
+Do NOT include prices — the app fetches live prices from pharmacies using search_term.
 Accuracy rules:
 - Use the exact Indian brand strength (e.g. Dolo = Dolo 650, Paracetamol 650 mg).
 - The Ayurvedic option MUST treat the same condition (e.g. fever → Giloy / Tulsi; acidity → Avipattikar;
@@ -406,14 +409,12 @@ The patient typed a medicine name OR a symptom. Respond ONLY with valid JSON:
   "allopathy": {
     "name": "Dolo 650",
     "works_in": "30–60 min",
-    "typical_price": "~₹30 for 15 tablets",
     "side_effects": "Short honest list",
     "avoid_if": "Short list"
   },
   "ayurvedic": {
     "name": "e.g. Patanjali Giloy Ghanvati (or null if no sensible alternative)",
     "works_in": "e.g. 2–3 days (gentler)",
-    "typical_price": "~₹90",
     "note": "When it makes sense"
   },
   "advice": "One practical safety line",
@@ -425,6 +426,7 @@ Rules:
   sleeping pills, antidepressants, anti-epileptics, blood thinners, opioids, montelukast, and any Schedule H/H1/X drug.
 - If prescription is required, set "ayurvedic" to null.
 - If it is not a medicine or symptom at all, return {"found": false}.
+- Never include prices (the app shows live pharmacy prices).
 Return ONLY JSON."""
 
 # Safety net — these always require a prescription, whatever the model says
@@ -467,12 +469,17 @@ def triage(payload: dict, user: dict = Depends(require_user)):
         }
 
 
+def _complete(**kwargs):
+    """Groq call off the event loop (the SDK is synchronous)."""
+    return asyncio.to_thread(client.chat.completions.create, **kwargs)
+
+
 @app.post("/medicine-check")
-def medicine_check(payload: dict, user: dict = Depends(require_user)):
-    """Structured OTC vs prescription check + allopathy / ayurvedic comparison."""
+async def medicine_check(payload: dict, user: dict = Depends(require_user)):
+    """Structured OTC vs prescription check + allopathy / ayurvedic comparison, with live prices."""
     query = redact((payload.get("query") or "").strip(), own_names(user))
     try:
-        response = client.chat.completions.create(
+        response = await _complete(
             model=MODEL,
             messages=[
                 {"role": "system", "content": MEDICINE_CHECK_PROMPT},
@@ -488,6 +495,19 @@ def medicine_check(payload: dict, user: dict = Depends(require_user)):
         ):
             data["requires_prescription"] = True
             data["ayurvedic"] = None
+        if data.get("found"):
+            allo = data.get("allopathy") or {}
+            ayur = data.get("ayurvedic") or {}
+            terms = [allo.get("name") or data.get("search_term") or data.get("name"), ayur.get("name")]
+            prices = await asyncio.gather(*(search_prices(t) for t in terms if t), return_exceptions=True)
+            prices = [p if isinstance(p, dict) else None for p in prices]
+            if allo and prices and prices[0]:
+                allo["prices"] = prices[0]["best"]
+                allo["price"] = price_line(prices[0])
+            if ayur and len(prices) > 1 and prices[1]:
+                ayur["prices"] = prices[1]["best"]
+                ayur["price"] = price_line(prices[1])
+            data["prices_fetched_at"] = next((p["fetched_at"] for p in prices if p), None)
         return data
     except Exception as e:
         return {"found": False, "error": str(e)}
@@ -512,12 +532,12 @@ async def extract_report(file: UploadFile = File(...), user: dict = Depends(requ
 
 
 @app.post("/medicine")
-def medicine_compare(payload: dict, user: dict = Depends(require_user)):
-    """Compare all treatment options for a symptom or medicine name."""
+async def medicine_compare(payload: dict, user: dict = Depends(require_user)):
+    """Compare treatment options for a symptom or medicine — clinical info from the AI, prices live from pharmacies."""
     try:
         query = redact(payload.get("query", ""), own_names(user))
 
-        response = client.chat.completions.create(
+        response = await _complete(
             model=MODEL,
             messages=[
                 {"role": "system", "content": MEDICINE_PROMPT},
@@ -528,6 +548,18 @@ def medicine_compare(payload: dict, user: dict = Depends(require_user)):
         )
 
         data = clean_json_response(response.choices[0].message.content)
+        meds = [m for m in data.get("medicines") or [] if isinstance(m, dict) and m.get("name")][:4]
+        results = await asyncio.gather(
+            *(search_prices(m.get("search_term") or m["name"]) for m in meds), return_exceptions=True
+        )
+        for med, live in zip(meds, results):
+            live = live if isinstance(live, dict) else None
+            med["prices"] = live["best"] if live else []
+            med["other_offers"] = [o for o in (live["offers"] if live else []) if o not in med["prices"]][:6]
+            med["links"] = live["links"] if live else {}
+            med["sources"] = live["sources"] if live else {}
+        data["medicines"] = meds
+        data["prices_fetched_at"] = int(time.time())
         return data
 
     except Exception as e:
